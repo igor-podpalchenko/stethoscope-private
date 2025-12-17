@@ -1,0 +1,58 @@
+{
+    io: {
+  	output: {
+	    "remote-host": {
+		"enabled": true,
+      		"host": "127.0.0.1",
+      		"requests_port": 33030,
+      		"responses_port": 33040,
+		"timeouts": { 
+		     "connect": 5,
+		     "retry-every": 30
+		 },
+		"hex_encode_binary_payloads": true
+  	    },
+            listner: {
+		"enabled": true,
+      		"first_requests_port": 33010,
+      		"first_responses_port": 33020,
+		"port_range_start": 33530,
+		"port_range_end": 33600,
+      		"bind_ip": "0.0.0.0",
+		"_bind_interface": "en1",
+		"timeouts": { 
+		      "ack_stall_sec": 5
+		}
+            },
+	    file: {
+		"enabled": true,
+		"path": "tcpdumps/"
+	    },
+	},
+	input: {
+	    "capture": {
+		"iface": "en0",
+      		"_iface": "utun6",
+      		"bpf-filter": "tcp and ((src host {local_ip} and dst host {remote_ip} and dst port {remote_port}) or (src host {remote_ip} and src port {remote_port} and dst host {local_ip}))",
+		"local_ip": "192.168.5.69",
+		"_local_ip": "100.79.85.9",
+		"remote_ip": "192.168.5.110",
+		"remote_port": 5000,
+		"_local_port": 56221
+    	    },
+	}
+    },
+    "control": {
+	plain-socket: {
+	   "enabled": true,
+      	   "bind_ip": "0.0.0.0",
+	   "listen_port": 50005
+	},
+	http: {
+	   "enabled": true,
+           "bind_ip": "0.0.0.0",
+           "listen_port": 50010
+	}
+    },
+}
+

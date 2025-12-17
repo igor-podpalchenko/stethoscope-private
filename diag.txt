@@ -1,0 +1,19 @@
+route get -host 192.168.5.110
+
+   route to: 192.168.5.110
+destination: 192.168.5.0
+       mask: 255.255.255.0
+  interface: utun6
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+
+
+# run sniffer
+sudo python3 stethoscope.py --config config.json
+
+# run plain-text socket reader
+nc 127.0.0.1 50005
+
+# run local listner with output to console
+nc -l 127.0.0.1 33030
