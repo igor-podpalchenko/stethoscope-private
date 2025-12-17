@@ -1,0 +1,43 @@
+{
+    io: {
+  	output: {
+	    remote-host: {
+		"enabled": true,
+      		"host": "192.168.1.10",
+      		"requests_port": 33521,
+      		"responses_port": 33522,
+		"timeouts": { 
+		     "connect": 5,
+		     "retry-every": 30
+		 }
+  	    },
+            listner: {
+		"enabled": true,
+      		"first_requests_port": 33520,
+      		"first_responses_port": 33510,
+		"port_range_start": 33530,
+		"port_range_end": 33600,
+      		"bind_ip": "0.0.0.0",
+		"bind_interface": "en1",
+		"timeouts": { 
+		      "ack_stall_sec": 5
+		}
+            }
+	},
+	input: {
+	    "capture": {
+      		"iface": "tun1",
+      		"bpf-filter": "tcp and ((src host {local_ip} and dst host {remote_ip} and dst port {remote_port}) or (src host {remote_ip} and src port {remote_port} and dst host {local_ip}))",
+		"local_ip": "100.79.85.9",
+		"remote_ip": "8.8.8.8",
+		"remote_port": 53,
+		"local_port": 56221
+    	    },
+	}
+    },
+    "control": { 
+      "bind_ip": "0.0.0.0",
+      "listen_port": 50005
+    },
+}
+
