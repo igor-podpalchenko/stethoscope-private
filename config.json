@@ -47,10 +47,10 @@
 	"file": {
 		"enabled": true,
 		"path": "stethoscope.log",
-		"verbosity": "INFO"
+		"verbosity": "DEBUG"
         },
         "console": {
-		"verbosity": "DEBUG"
+		"verbosity": "INFO"
 	}
     }
 }

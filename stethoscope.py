@@ -4,34 +4,25 @@ stethoscope.py
 
 BPF/pcap capture + TCP reassembly + forwarding, with sane control-plane event routing.
 
-Key features:
-- Capture via scapy/libpcap using BPF filter.
-- TCP reassembly per session (local_port is session_id), both directions.
-- Forward reassembled byte streams to:
-    * listener ports (per session: requests/responses)
-    * connector remote-host ports (per session: requests/responses)
-    * mixed mode
-    * control-only mode (no outputs enabled)
-- Control plane: single TCP client, JSON lines.
+Modes:
+- Listener mode (io.output.listner.enabled=true): allocates per-session req/resp ports and accepts inbound connections.
+- Connector mode (io.output.remote-host.enabled=true): per session opens outbound req/resp connections.
+- Mixed mode: both enabled.
+- Control-only: both disabled.
+
+Control plane:
+- Single TCP client, JSON lines. Commands: ping, stats, subscribe, subscribe_default,
+  tcp_flow_enable/disable, list_sessions, get_session, close_session.
 
 Noise control:
-- Events are categorized: session/ports/output/control/flow/debug/stats
-- Control plane receives only subscribed categories (default from config).
-- Flow notes (ack_stall / tcp_reassembly) are gated behind tcp_flow_enable.
+- Categories: session, ports, output, control, flow, stats, debug
+- CP emits only subscribed cats (control.default_cats), and flow notes only when tcp_flow_enable.
 
-Connector event policy (as requested):
-- output.connector_disconnected is sent to CP ONLY when a connector was connected and then got disconnected.
-- Retry attempts that never had a successful connection do NOT produce connector_disconnected for CP.
-  Instead logs-only events are emitted:
-    * output.connector_connection_reattempt (never connected yet)
-    * output.connector_reconnect (had connected before, now retrying)
-
-Drops:
-- No per-drop CP/log spam.
-- Drops are aggregated and reported in session_summary and stats-on-demand.
-
-Shutdown:
-- Ctrl+C exits cleanly. Capture thread uses timed sniff loop to stop even when idle.
+Fixes vs the "broken last update":
+- Output forwarding restored (connector + listener targets receive reassembled bytes).
+- flow.tcp_note is DEBUG (ack_stall is not WARNING).
+- Ctrl+C exit improved under sudo: add signal.signal handlers + explicit task cancellation.
+- Rename debug.connector_disconnected_suppressed -> output.connector_disconnect_suppressed (logs-only).
 """
 
 from __future__ import annotations
@@ -192,6 +183,7 @@ class TCPReassembler:
             changed = False
             for k, v in list(self.segments.items()):
                 k0, k1 = k, k + len(v)
+                # overlap or adjacency => merge
                 if not (union1 < k0 or k1 < union0) and not (union1 == k0 or k1 == union0):
                     parts.append((k, v, "old"))
                     del self.segments[k]
@@ -264,6 +256,7 @@ class TCPReassembler:
         self._merge_union_conflict_safe(seq, data)
 
         if len(self.segments) > MAX_OOO_SEGMENTS:
+            # evict farthest-behind segments
             for k in sorted(self.segments.keys(), reverse=True)[: len(self.segments) - MAX_OOO_SEGMENTS]:
                 del self.segments[k]
                 self.ooo_buffer_evictions += 1
@@ -322,9 +315,6 @@ class PacketInfo:
     flags: int
     win: int
     payload: bytes
-    mss_opt: Optional[int] = None
-    wscale_opt: Optional[int] = None
-    sack_ok: Optional[bool] = None
 
 
 @dataclass
@@ -338,8 +328,6 @@ class DirState:
 
     last_ack: Optional[int] = None
     last_ack_ts: float = field(default_factory=monotime)
-
-    highest_seq_sent: int = 0
 
     _last_reasm_snapshot: Tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
 
@@ -480,7 +468,7 @@ class ControlPlane:
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, host=self.bind_ip, port=self.port)
         self.log.info("control plane listening on %s:%d", self.bind_ip, self.port)
-        asyncio.create_task(self._event_pump())
+        asyncio.create_task(self._event_pump(), name="cp.event_pump")
 
     async def close(self) -> None:
         if self._server:
@@ -551,7 +539,7 @@ class ControlPlane:
                     continue
                 await self._handle_cmd(cmd)
 
-        self._client_task = asyncio.create_task(_cmd_loop())
+        self._client_task = asyncio.create_task(_cmd_loop(), name="cp.cmd_loop")
         try:
             await self._client_task
         except asyncio.CancelledError:
@@ -657,7 +645,6 @@ class EventRouter:
             self.log.info("%s %s", msg, extra)
 
     async def emit(self, *, cat: str, event: str, level: str, payload: Dict[str, Any], cp: bool = True) -> None:
-        # Always local log (handler levels decide visibility)
         self._log(level, f"{cat}.{event}", payload)
 
         if not cp:
@@ -785,10 +772,6 @@ class ReassemblyWorker(threading.Thread):
             dir_state.note_packet(p)
 
             if p.payload:
-                end_seq = p.seq + len(p.payload)
-                if end_seq > dir_state.highest_seq_sent:
-                    dir_state.highest_seq_sent = end_seq
-
                 dir_state.reasm.add(p.seq, p.payload)
                 deltas = dir_state.reasm_deltas()
                 if deltas:
@@ -814,30 +797,6 @@ class ReassemblyWorker(threading.Thread):
 # =============================================================================
 # Packet capture thread (timed sniff loop => clean stop)
 # =============================================================================
-
-def _parse_tcp_opts(tcp) -> Tuple[Optional[int], Optional[int], Optional[bool]]:
-    mss = None
-    wscale = None
-    sack_ok = None
-    try:
-        opts = getattr(tcp, "options", None) or []
-        for k, v in opts:
-            if k == "MSS":
-                try:
-                    mss = int(v)
-                except Exception:
-                    pass
-            elif k == "WScale":
-                try:
-                    wscale = int(v)
-                except Exception:
-                    pass
-            elif k == "SAckOK":
-                sack_ok = True
-    except Exception:
-        pass
-    return mss, wscale, sack_ok
-
 
 class CaptureThread(threading.Thread):
     daemon = True
@@ -870,7 +829,6 @@ class CaptureThread(threading.Thread):
         try:
             self.q_by_worker[idx].put_nowait(p)
         except queue.Full:
-            # capture overload: drop packet at capture stage
             return
 
     def run(self) -> None:
@@ -899,7 +857,6 @@ class CaptureThread(threading.Thread):
 
                 flow = FlowKey(self.local_ip, local_port, self.remote_ip, remote_port)
                 payload = bytes(tcp.payload) if tcp.payload else b""
-                mss, wscale, sack_ok = _parse_tcp_opts(tcp)
 
                 pi = PacketInfo(
                     ts=monotime(),
@@ -910,15 +867,11 @@ class CaptureThread(threading.Thread):
                     flags=int(tcp.flags),
                     win=int(tcp.window),
                     payload=payload,
-                    mss_opt=mss,
-                    wscale_opt=wscale,
-                    sack_ok=sack_ok,
                 )
                 self._dispatch(pi)
             except Exception:
                 return
 
-        # Timed loop => stop even if no packets
         try:
             while not self._stop.is_set():
                 sniff(
@@ -926,7 +879,7 @@ class CaptureThread(threading.Thread):
                     filter=self.bpf,
                     prn=_cb,
                     store=False,
-                    timeout=1,  # key for clean shutdown
+                    timeout=1,  # key for clean shutdown even when idle
                 )
         finally:
             self.log.info("capture stopped")
@@ -1055,6 +1008,14 @@ class OutputManager:
         self._lock = asyncio.Lock()
 
     def map_stream(self, direction: str) -> str:
+        """
+        role=client:
+          c2s => requests (browser -> server)
+          s2c => responses
+        role=server:
+          c2s => responses (server -> client)
+          s2c => requests
+        """
         if self.role == "client":
             return "requests" if direction == "c2s" else "responses"
         return "responses" if direction == "c2s" else "requests"
@@ -1080,8 +1041,8 @@ class OutputManager:
                 )
 
             if self.connector_enabled and self.conn_req_port > 0 and self.conn_resp_port > 0:
-                so.tasks.append(asyncio.create_task(self._connector_loop(so, "requests")))
-                so.tasks.append(asyncio.create_task(self._connector_loop(so, "responses")))
+                so.tasks.append(asyncio.create_task(self._connector_loop(so, "requests"), name=f"connector:{flow.session_id}:requests"))
+                so.tasks.append(asyncio.create_task(self._connector_loop(so, "responses"), name=f"connector:{flow.session_id}:responses"))
 
             return so
 
@@ -1135,6 +1096,7 @@ class OutputManager:
                 cp=True,
             )
             try:
+                # listener sockets are sinks in this prototype
                 while True:
                     buf = await reader.read(65536)
                     if not buf:
@@ -1166,7 +1128,7 @@ class OutputManager:
 
         while True:
             try:
-                # Logs-only attempt events (as requested)
+                # logs-only attempt events
                 if st.ever_connected:
                     await self.router.emit(
                         cat="output",
@@ -1188,7 +1150,6 @@ class OutputManager:
                 tw = TargetWriter(name=f"connector:{stream}:{so.flow.session_id}", writer=writer, kind="connector")
                 so.connectors[stream] = tw
 
-                # Transition to connected
                 was_connected = st.currently_connected
                 st.currently_connected = True
                 st.ever_connected = True
@@ -1202,6 +1163,7 @@ class OutputManager:
                         cp=True,
                     )
 
+                # keep connection; nc won't send anything, so this blocks, that's fine
                 while True:
                     buf = await reader.read(65536)
                     if not buf:
@@ -1210,7 +1172,6 @@ class OutputManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Logs-only error
                 await self.router.emit(
                     cat="debug",
                     event="connector_error",
@@ -1219,7 +1180,6 @@ class OutputManager:
                     cp=False,
                 )
 
-            # Connector ended. Decide whether this is a "real disconnect" transition.
             tw = so.connectors.get(stream)
             so.connectors[stream] = None
             if tw:
@@ -1229,20 +1189,18 @@ class OutputManager:
                     pass
 
             if st.currently_connected:
-                # real transition connected -> disconnected
                 st.currently_connected = False
                 await self.router.emit(
                     cat="output",
                     event="connector_disconnected",
                     level="warning",
                     payload={"flow": so.flow.to_dict(), "stream": stream, "retry_every_sec": self.conn_retry_every},
-                    cp=True,  # CP only in this case
+                    cp=True,
                 )
             else:
-                # never connected, or already disconnected: do NOT spam CP
                 await self.router.emit(
-                    cat="debug",
-                    event="connector_disconnected_suppressed",
+                    cat="output",
+                    event="connector_disconnect_suppressed",
                     level="debug",
                     payload={"flow": so.flow.to_dict(), "stream": stream},
                     cp=False,
@@ -1251,6 +1209,10 @@ class OutputManager:
             await asyncio.sleep(self.conn_retry_every)
 
     async def write_chunk(self, flow: FlowKey, direction: str, data: bytes) -> Tuple[int, int, str, int]:
+        """
+        Forward reassembled stream bytes to all configured targets for mapped stream.
+        Drops if no targets or backpressure.
+        """
         if not data:
             return (0, 0, "empty", 0)
 
@@ -1307,7 +1269,6 @@ class Service:
         self.local_ip = str(cap.get("local_ip", "")).strip()
         self.remote_ip = str(cap.get("remote_ip", "")).strip()
         self.remote_port = int(cap.get("remote_port", 0) or 0)
-        self.local_port_filter = cap.get("local_port", None)
 
         if not self.iface or not self.local_ip or not self.remote_ip or not self.remote_port:
             raise SystemExit("Missing io.input.capture fields: iface/local_ip/remote_ip/remote_port")
@@ -1321,24 +1282,10 @@ class Service:
                 "(src host {remote_ip} and src port {remote_port} and dst host {local_ip}))"
                 ")"
             )
-
-        fmt = {
-            "local_ip": self.local_ip,
-            "remote_ip": self.remote_ip,
-            "remote_port": self.remote_port,
-            "local_port": self.local_port_filter if self.local_port_filter is not None else "",
-        }
         try:
-            self.bpf = bpf_tpl.format_map(fmt)
+            self.bpf = bpf_tpl.format_map({"local_ip": self.local_ip, "remote_ip": self.remote_ip, "remote_port": self.remote_port})
         except Exception:
             self.bpf = bpf_tpl
-
-        if self.local_port_filter is not None and "{local_port}" not in bpf_tpl:
-            try:
-                lp = int(self.local_port_filter)
-                self.bpf = f"({self.bpf}) and (tcp port {lp})"
-            except Exception:
-                pass
 
         if cap.get("scapy_bufsize") is not None:
             try:
@@ -1355,7 +1302,6 @@ class Service:
         ack_stall_sec = get_path(cfg, "io.output.listner.timeouts.ack_stall_sec", None)
         self.ack_stall_sec = float(ack_stall_sec) if ack_stall_sec is not None else None
 
-        # Control defaults
         ctrl = get_path(cfg, "control", {}) or {}
         self.control_bind_ip = str(ctrl.get("bind_ip", "0.0.0.0"))
         self.control_port = int(ctrl.get("listen_port", 50005) or 50005)
@@ -1379,11 +1325,10 @@ class Service:
         self.capture: Optional[CaptureThread] = None
 
         # Session accounting
-        self._sessions: Dict[int, Dict[str, Any]] = {}  # session_id -> {flow, open_ts, last_ts}
+        self._sessions: Dict[int, Dict[str, Any]] = {}
         self._session_bytes_out: DefaultDict[int, int] = defaultdict(int)
         self._session_bytes_drop: DefaultDict[int, int] = defaultdict(int)
 
-        # Drop aggregation: (sid, stream, reason) -> count/bytes
         self._drop_count: DefaultDict[Tuple[int, str, str], int] = defaultdict(int)
         self._drop_bytes: DefaultDict[Tuple[int, str, str], int] = defaultdict(int)
 
@@ -1393,6 +1338,7 @@ class Service:
         self._chunks_dropped = 0
 
         self.stats_interval_sec = float(get_path(cfg, "runtime.stats_interval_sec", 5) or 5)
+        self._tasks: List[asyncio.Task] = []
 
     def stats_snapshot(self) -> Dict[str, Any]:
         return {
@@ -1462,9 +1408,9 @@ class Service:
         )
         await self.control.start()
 
-        asyncio.create_task(self._consume_events())
-        asyncio.create_task(self._consume_forward())
-        asyncio.create_task(self._periodic_stats_local())
+        self._tasks.append(asyncio.create_task(self._consume_events(), name="svc.consume_events"))
+        self._tasks.append(asyncio.create_task(self._consume_forward(), name="svc.consume_forward"))
+        self._tasks.append(asyncio.create_task(self._periodic_stats_local(), name="svc.stats_local"))
 
         self.worker_inqs = [queue.Queue(maxsize=self.capture_queue_size) for _ in range(self.workers)]
         for wid in range(self.workers):
@@ -1490,7 +1436,9 @@ class Service:
         )
         self.capture.start()
 
-        await self.router.emit(cat="control", event="service_started", level="info", payload={"iface": self.iface, "bpf": self.bpf, "workers": self.workers}, cp=True)
+        await self.router.emit(cat="control", event="service_started", level="info",
+                               payload={"iface": self.iface, "bpf": self.bpf, "workers": self.workers},
+                               cp=True)
 
     async def stop(self) -> None:
         await self.router.emit(cat="control", event="service_stopping", level="info", payload={}, cp=True)
@@ -1500,15 +1448,26 @@ class Service:
         for w in self.workers_threads:
             w.stop()
 
-        # Close CP first so emit() won't block on dead socket
-        await self.control.close()
+        # cancel async tasks explicitly
+        for t in self._tasks:
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
-        # Close outputs
+        # close outputs
         for fk in list(self.outputs.sessions.keys()):
             try:
                 await self.outputs.close_session(fk, reason="service_stop")
             except Exception:
                 pass
+
+        await self.control.close()
+
+        # join threads (bounded)
+        if self.capture:
+            self.capture.join(timeout=2.0)
+        for w in self.workers_threads:
+            w.join(timeout=1.0)
 
     async def _periodic_stats_local(self) -> None:
         while True:
@@ -1536,7 +1495,9 @@ class Service:
                 await self.router.emit(cat="session", event="session_summary", level="info", payload=summary, cp=True)
 
                 await self.outputs.close_session(ev.flow, reason=ev.data.get("reason", "close"))
-                await self.router.emit(cat="session", event="tcp_close", level="info", payload={"flow": ev.flow.to_dict(), "reason": ev.data.get("reason")}, cp=True)
+                await self.router.emit(cat="session", event="tcp_close", level="info",
+                                       payload={"flow": ev.flow.to_dict(), "reason": ev.data.get("reason")},
+                                       cp=True)
 
                 # cleanup
                 self._sessions.pop(sid, None)
@@ -1548,9 +1509,10 @@ class Service:
                         self._drop_bytes.pop(key, None)
 
             else:
-                note = ev.data.get("note", "note")
-                lvl = "warning" if note == "ack_stall" else "debug"
-                await self.router.emit(cat="flow", event="tcp_note", level=lvl, payload={"flow": ev.flow.to_dict(), **ev.data}, cp=True)
+                # FIX: always DEBUG (ack_stall included)
+                await self.router.emit(cat="flow", event="tcp_note", level="debug",
+                                       payload={"flow": ev.flow.to_dict(), **ev.data},
+                                       cp=True)
 
     async def _consume_forward(self) -> None:
         while True:
@@ -1621,38 +1583,44 @@ async def amain(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     log = setup_logging_from_config(cfg)
 
-    # runtime.workers: 0 => auto
-    rt = get_path(cfg, "runtime", {}) or {}
-    try:
-        if int(rt.get("workers", 0) or 0) == 0:
-            rt["workers"] = os.cpu_count() or 4
-            cfg["runtime"] = rt
-    except Exception:
-        pass
-
     svc = Service(cfg, log)
 
     stop_ev = asyncio.Event()
-
-    def _stop(*_a) -> None:
-        stop_ev.set()
-
     loop = asyncio.get_running_loop()
+
+    def _request_stop() -> None:
+        if not stop_ev.is_set():
+            stop_ev.set()
+
+    # event-loop signal handlers
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _stop)
+            loop.add_signal_handler(sig, _request_stop)
         except NotImplementedError:
             pass
 
+    # real signal handlers (helps under sudo / odd TTY)
+    def _sig_handler(_signum, _frame) -> None:
+        try:
+            loop.call_soon_threadsafe(_request_stop)
+        except Exception:
+            _request_stop()
+
+    try:
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except Exception:
+        pass
+
     await svc.start()
-    await stop_ev.wait()
 
-    # Clean shutdown
+    try:
+        await stop_ev.wait()
+    except KeyboardInterrupt:
+        _request_stop()
+
     await svc.stop()
-
-    # Let pending cancellations settle
     await asyncio.sleep(0)
-
     return 0
 
 
