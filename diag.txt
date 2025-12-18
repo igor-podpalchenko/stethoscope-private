@@ -1,3 +1,24 @@
+
+# MacOS print routing table
+
+netstat -rn -f inet
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+192.168.5.1        9c:53:22:c3:c4:b1  UHLWIir               en0   1200
+192.168.5.8        78:e3:6d:27:47:78  UHLWI                 en0   1190
+192.168.5.9        34:86:5d:32:87:6c  UHLWI                 en0   1190
+192.168.5.12       f2:18:3d:ee:d8:ee  UHLWI                 en0   1148
+192.168.5.20       40:22:d8:78:89:fc  UHLWI                 en0   1187
+192.168.5.56       90:dd:5d:ef:7e:b2  UHLWI                 en0   1107
+192.168.5.65       66:c1:e9:c2:4f:6e  UHLWI                 en0   1146
+192.168.5.69/32    link#14            UCS                   en0      !
+192.168.5.110      0:11:32:2c:76:5d   UHLWIi                en0   1186
+192.168.5.255      ff:ff:ff:ff:ff:ff  UHLWbI                en0      !
+
+
+# MacOS check interface used to access IP
+
 route get -host 192.168.5.110
 
    route to: 192.168.5.110
@@ -14,6 +35,27 @@ sudo python3 stethoscope.py --config config.json
 
 # run plain-text socket reader
 nc 127.0.0.1 50005
+# same but with jq postprocessing
+nc 127.0.0.1 50005 | jq -c .
 
 # run local listner with output to console
 nc -l 127.0.0.1 33030
+
+
+# Tailscale local trafic capture starts working when:
+# Tailscale client -> Exit Nodes (one external active) -> Allow Local Network Access
+
+# Docker nuances (only Linux, MacOS will not work because kernel that serves docker in other VM)
+
+Linux host + Docker (native Linux)
+
+1) Packet capture + cBPF: works, but you only see what your namespace can see
+	•	A container has its own network namespace (unless you use host networking), so tcpdump -i eth0 inside a container typically captures only that container’s traffic on its veth interface.
+	•	If you want to capture “the host’s real traffic”, you usually do it:
+	•	on the host (e.g., tcpdump -i any '...'), or
+	•	in a container with --network host (Linux only), or
+	•	by joining another namespace (nsenter -t <pid> -n tcpdump ...).
+
+Capabilities: packet sniffing usually needs CAP_NET_RAW (and often CAP_NET_ADMIN depending on how you attach / what you do).
+Docker defaults may block things if you’re not privileged.
+

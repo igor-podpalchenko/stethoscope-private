@@ -1,6 +1,6 @@
 {
-    io: {
-  	output: {
+    "io": {
+  	"output": {
 	    "remote-host": {
 		"enabled": true,
       		"host": "127.0.0.1",
@@ -11,7 +11,7 @@
 		     "retry-every": 30
 		 }
   	    },
-            listner: {
+            "listner": {
 		"enabled": true,
       		"first_requests_port": 33010,
       		"first_responses_port": 33020,
@@ -24,22 +24,34 @@
 		}
             }
 	},
-	input: {
+	"input": {
 	    "capture": {
-		"iface": "en0",
-      		"_iface": "utun6",
       		"bpf-filter": "tcp and ((src host {local_ip} and dst host {remote_ip} and dst port {remote_port}) or (src host {remote_ip} and src port {remote_port} and dst host {local_ip}))",
+		"iface": "en0",
+      		"_iface": "utun7",
 		"local_ip": "192.168.5.69",
 		"_local_ip": "100.79.85.9",
 		"remote_ip": "192.168.5.110",
 		"remote_port": 5000,
 		"_local_port": 56221
-    	    },
+    	    }
 	}
     },
     "control": { 
       "bind_ip": "0.0.0.0",
-      "listen_port": 50005
+      "listen_port": 50005,
+      "default_cats": ["session","ports","output","control"]
     },
+    "logging": {
+	"verbosity_levels_available": "DEBUG, INFO, WARNING, ERROR",
+	"file": {
+		"enabled": true,
+		"path": "stethoscope.log",
+		"verbosity": "INFO"
+        },
+        "console": {
+		"verbosity": "DEBUG"
+	}
+    }
 }
 
