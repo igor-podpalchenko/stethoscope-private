@@ -4,25 +4,25 @@ stethoscope.py
 
 BPF/pcap capture + TCP reassembly + forwarding, with sane control-plane event routing.
 
-Modes:
-- Listener mode (io.output.listner.enabled=true): allocates per-session req/resp ports and accepts inbound connections.
-- Connector mode (io.output.remote-host.enabled=true): per session opens outbound req/resp connections.
-- Mixed mode: both enabled.
-- Control-only: both disabled.
+Key behavior:
+- Control plane is NOT a firehose.
+- Events are categorized: session/ports/output/control/flow/debug/stats
+- CP receives only subscribed categories (control.default_cats) by default.
+- flow events (tcp_note) are emitted to CP only when tcp_flow_enable is set (global or per-session).
+- Periodic stats are LOCAL logs only by default.
 
-Control plane:
-- Single TCP client, JSON lines. Commands: ping, stats, subscribe, subscribe_default,
-  tcp_flow_enable/disable, list_sessions, get_session, close_session.
+Requested changes implemented:
+- flow.tcp_note (including ack_stall) is DEBUG.
+- output.connector_disconnected is sent to CP ONLY if that connector stream was connected before.
+  Otherwise, it logs output.connector_connection_reattempt / output.connector_reconnect locally only.
+- Ctrl+C clean shutdown under sudo: timed sniff loop + explicit signal handlers + task cancellation + joins.
 
-Noise control:
-- Categories: session, ports, output, control, flow, stats, debug
-- CP emits only subscribed cats (control.default_cats), and flow notes only when tcp_flow_enable.
-
-Fixes vs the "broken last update":
-- Output forwarding restored (connector + listener targets receive reassembled bytes).
-- flow.tcp_note is DEBUG (ack_stall is not WARNING).
-- Ctrl+C exit improved under sudo: add signal.signal handlers + explicit task cancellation.
-- Rename debug.connector_disconnected_suppressed -> output.connector_disconnect_suppressed (logs-only).
+Restored vs your reference source:
+- io.input.capture.local_port filtering support.
+- TCP option parsing: MSS/WScale/SAckOK.
+- Derived metrics tracked per direction: max_rwnd_bytes (scaled window), max_inflight_est.
+- runtime.workers == 0 => auto (CPU count).
+- CLI --log-level override (optional), while still supporting config-based logging.
 """
 
 from __future__ import annotations
@@ -143,7 +143,7 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# TCP reassembly
+# TCP reassembly (interval merge, overlap/retransmit safe)
 # =============================================================================
 
 MAX_OOO_SEGMENTS = 4096
@@ -183,7 +183,6 @@ class TCPReassembler:
             changed = False
             for k, v in list(self.segments.items()):
                 k0, k1 = k, k + len(v)
-                # overlap or adjacency => merge
                 if not (union1 < k0 or k1 < union0) and not (union1 == k0 or k1 == union0):
                     parts.append((k, v, "old"))
                     del self.segments[k]
@@ -204,8 +203,7 @@ class TCPReassembler:
         buf = bytearray(union1 - union0)
         filled = bytearray(union1 - union0)
 
-        # old first, then new (so new cannot overwrite old)
-        parts_sorted = sorted(parts, key=lambda x: 0 if x[2] == "old" else 1)
+        parts_sorted = sorted(parts, key=lambda x: 0 if x[2] == "old" else 1)  # old first
         conflict = 0
         for p0, pv, tag in parts_sorted:
             off = p0 - union0
@@ -256,7 +254,6 @@ class TCPReassembler:
         self._merge_union_conflict_safe(seq, data)
 
         if len(self.segments) > MAX_OOO_SEGMENTS:
-            # evict farthest-behind segments
             for k in sorted(self.segments.keys(), reverse=True)[: len(self.segments) - MAX_OOO_SEGMENTS]:
                 del self.segments[k]
                 self.ooo_buffer_evictions += 1
@@ -315,6 +312,9 @@ class PacketInfo:
     flags: int
     win: int
     payload: bytes
+    mss_opt: Optional[int] = None
+    wscale_opt: Optional[int] = None
+    sack_ok: Optional[bool] = None
 
 
 @dataclass
@@ -329,6 +329,12 @@ class DirState:
     last_ack: Optional[int] = None
     last_ack_ts: float = field(default_factory=monotime)
 
+    # restored metrics
+    max_rwnd_bytes: int = 0
+    wscale: Optional[int] = None
+    highest_seq_sent: int = 0
+    max_inflight_est: int = 0
+
     _last_reasm_snapshot: Tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
 
     def note_packet(self, p: PacketInfo) -> None:
@@ -338,10 +344,20 @@ class DirState:
         self.bytes_payload += plen
         if plen > self.max_payload:
             self.max_payload = plen
+
         if p.ack:
             if self.last_ack is None or p.ack > self.last_ack:
                 self.last_ack = p.ack
                 self.last_ack_ts = p.ts
+
+        if p.wscale_opt is not None:
+            self.wscale = p.wscale_opt
+
+        # advertised receive window scaled
+        scale = self.wscale or 0
+        rwnd = int(p.win) << int(scale)
+        if rwnd > self.max_rwnd_bytes:
+            self.max_rwnd_bytes = rwnd
 
     def reasm_deltas(self) -> Dict[str, int]:
         r = self.reasm
@@ -622,7 +638,7 @@ class ControlPlane:
 
 
 # =============================================================================
-# Event router: local logs vs CP, with per-event cp flag
+# Event router: local logs vs CP, with cp flag
 # =============================================================================
 
 class EventRouter:
@@ -771,6 +787,25 @@ class ReassemblyWorker(threading.Thread):
             dir_state = st.c2s if p.from_local else st.s2c
             dir_state.note_packet(p)
 
+            # restored: highest seq sent + inflight estimate from peer ACK
+            if p.payload:
+                end_seq = p.seq + len(p.payload)
+                if end_seq > dir_state.highest_seq_sent:
+                    dir_state.highest_seq_sent = end_seq
+
+            if p.from_local:
+                peer = st.s2c
+                if p.ack and peer.highest_seq_sent:
+                    inflight = max(0, peer.highest_seq_sent - p.ack)
+                    if inflight > peer.max_inflight_est:
+                        peer.max_inflight_est = inflight
+            else:
+                peer = st.c2s
+                if p.ack and peer.highest_seq_sent:
+                    inflight = max(0, peer.highest_seq_sent - p.ack)
+                    if inflight > peer.max_inflight_est:
+                        peer.max_inflight_est = inflight
+
             if p.payload:
                 dir_state.reasm.add(p.seq, p.payload)
                 deltas = dir_state.reasm_deltas()
@@ -797,6 +832,30 @@ class ReassemblyWorker(threading.Thread):
 # =============================================================================
 # Packet capture thread (timed sniff loop => clean stop)
 # =============================================================================
+
+def _parse_tcp_opts(tcp) -> Tuple[Optional[int], Optional[int], Optional[bool]]:
+    mss = None
+    wscale = None
+    sack_ok = None
+    try:
+        opts = getattr(tcp, "options", None) or []
+        for k, v in opts:
+            if k == "MSS":
+                try:
+                    mss = int(v)
+                except Exception:
+                    pass
+            elif k == "WScale":
+                try:
+                    wscale = int(v)
+                except Exception:
+                    pass
+            elif k == "SAckOK":
+                sack_ok = True
+    except Exception:
+        pass
+    return mss, wscale, sack_ok
+
 
 class CaptureThread(threading.Thread):
     daemon = True
@@ -857,6 +916,7 @@ class CaptureThread(threading.Thread):
 
                 flow = FlowKey(self.local_ip, local_port, self.remote_ip, remote_port)
                 payload = bytes(tcp.payload) if tcp.payload else b""
+                mss, wscale, sack_ok = _parse_tcp_opts(tcp)
 
                 pi = PacketInfo(
                     ts=monotime(),
@@ -867,6 +927,9 @@ class CaptureThread(threading.Thread):
                     flags=int(tcp.flags),
                     win=int(tcp.window),
                     payload=payload,
+                    mss_opt=mss,
+                    wscale_opt=wscale,
+                    sack_ok=sack_ok,
                 )
                 self._dispatch(pi)
             except Exception:
@@ -879,7 +942,7 @@ class CaptureThread(threading.Thread):
                     filter=self.bpf,
                     prn=_cb,
                     store=False,
-                    timeout=1,  # key for clean shutdown even when idle
+                    timeout=1,  # crucial for clean shutdown
                 )
         finally:
             self.log.info("capture stopped")
@@ -1008,14 +1071,6 @@ class OutputManager:
         self._lock = asyncio.Lock()
 
     def map_stream(self, direction: str) -> str:
-        """
-        role=client:
-          c2s => requests (browser -> server)
-          s2c => responses
-        role=server:
-          c2s => responses (server -> client)
-          s2c => requests
-        """
         if self.role == "client":
             return "requests" if direction == "c2s" else "responses"
         return "responses" if direction == "c2s" else "requests"
@@ -1128,7 +1183,7 @@ class OutputManager:
 
         while True:
             try:
-                # logs-only attempt events
+                # local logs only: connection attempt categorization
                 if st.ever_connected:
                     await self.router.emit(
                         cat="output",
@@ -1163,7 +1218,6 @@ class OutputManager:
                         cp=True,
                     )
 
-                # keep connection; nc won't send anything, so this blocks, that's fine
                 while True:
                     buf = await reader.read(65536)
                     if not buf:
@@ -1188,6 +1242,7 @@ class OutputManager:
                 except Exception:
                     pass
 
+            # Requested: CP event only if it *was* connected before.
             if st.currently_connected:
                 st.currently_connected = False
                 await self.router.emit(
@@ -1269,6 +1324,7 @@ class Service:
         self.local_ip = str(cap.get("local_ip", "")).strip()
         self.remote_ip = str(cap.get("remote_ip", "")).strip()
         self.remote_port = int(cap.get("remote_port", 0) or 0)
+        self.local_port_filter = cap.get("local_port", None)
 
         if not self.iface or not self.local_ip or not self.remote_ip or not self.remote_port:
             raise SystemExit("Missing io.input.capture fields: iface/local_ip/remote_ip/remote_port")
@@ -1282,10 +1338,25 @@ class Service:
                 "(src host {remote_ip} and src port {remote_port} and dst host {local_ip}))"
                 ")"
             )
+
+        fmt = {
+            "local_ip": self.local_ip,
+            "remote_ip": self.remote_ip,
+            "remote_port": self.remote_port,
+            "local_port": self.local_port_filter if self.local_port_filter is not None else "",
+        }
         try:
-            self.bpf = bpf_tpl.format_map({"local_ip": self.local_ip, "remote_ip": self.remote_ip, "remote_port": self.remote_port})
+            self.bpf = bpf_tpl.format_map(fmt)
         except Exception:
             self.bpf = bpf_tpl
+
+        # restored: if local_port is specified but template doesn't use it, append a cheap filter
+        if self.local_port_filter is not None and "{local_port}" not in bpf_tpl:
+            try:
+                lp = int(self.local_port_filter)
+                self.bpf = f"({self.bpf}) and (tcp port {lp})"
+            except Exception:
+                pass
 
         if cap.get("scapy_bufsize") is not None:
             try:
@@ -1295,7 +1366,14 @@ class Service:
                 pass
 
         rt = get_path(cfg, "runtime", {}) or {}
-        self.workers = clamp_int(rt.get("workers", os.cpu_count() or 4), default=4, lo=1, hi=256)
+        raw_workers = rt.get("workers", os.cpu_count() or 4)
+        try:
+            if int(raw_workers or 0) == 0:
+                raw_workers = os.cpu_count() or 4
+        except Exception:
+            pass
+        self.workers = clamp_int(raw_workers, default=4, lo=1, hi=256)
+
         self.capture_queue_size = clamp_int(rt.get("capture_queue_size", 50000), default=50000, lo=1000, hi=5_000_000)
 
         self.session_idle_sec = float(cap.get("session_idle_sec", 120) or 120)
@@ -1324,7 +1402,7 @@ class Service:
         self.workers_threads: List[ReassemblyWorker] = []
         self.capture: Optional[CaptureThread] = None
 
-        # Session accounting
+        # bookkeeping
         self._sessions: Dict[int, Dict[str, Any]] = {}
         self._session_bytes_out: DefaultDict[int, int] = defaultdict(int)
         self._session_bytes_drop: DefaultDict[int, int] = defaultdict(int)
@@ -1370,6 +1448,7 @@ class Service:
         meta = self._sessions.get(session_id)
         if not meta:
             return None
+
         drops: Dict[str, Dict[str, Dict[str, int]]] = {}
         for (sid, stream, reason), cnt in self._drop_count.items():
             if sid != session_id:
@@ -1436,9 +1515,13 @@ class Service:
         )
         self.capture.start()
 
-        await self.router.emit(cat="control", event="service_started", level="info",
-                               payload={"iface": self.iface, "bpf": self.bpf, "workers": self.workers},
-                               cp=True)
+        await self.router.emit(
+            cat="control",
+            event="service_started",
+            level="info",
+            payload={"iface": self.iface, "bpf": self.bpf, "workers": self.workers},
+            cp=True,
+        )
 
     async def stop(self) -> None:
         await self.router.emit(cat="control", event="service_stopping", level="info", payload={}, cp=True)
@@ -1448,13 +1531,11 @@ class Service:
         for w in self.workers_threads:
             w.stop()
 
-        # cancel async tasks explicitly
         for t in self._tasks:
             t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
-        # close outputs
         for fk in list(self.outputs.sessions.keys()):
             try:
                 await self.outputs.close_session(fk, reason="service_stop")
@@ -1463,7 +1544,6 @@ class Service:
 
         await self.control.close()
 
-        # join threads (bounded)
         if self.capture:
             self.capture.join(timeout=2.0)
         for w in self.workers_threads:
@@ -1495,11 +1575,14 @@ class Service:
                 await self.router.emit(cat="session", event="session_summary", level="info", payload=summary, cp=True)
 
                 await self.outputs.close_session(ev.flow, reason=ev.data.get("reason", "close"))
-                await self.router.emit(cat="session", event="tcp_close", level="info",
-                                       payload={"flow": ev.flow.to_dict(), "reason": ev.data.get("reason")},
-                                       cp=True)
+                await self.router.emit(
+                    cat="session",
+                    event="tcp_close",
+                    level="info",
+                    payload={"flow": ev.flow.to_dict(), "reason": ev.data.get("reason")},
+                    cp=True,
+                )
 
-                # cleanup
                 self._sessions.pop(sid, None)
                 self._session_bytes_out.pop(sid, None)
                 self._session_bytes_drop.pop(sid, None)
@@ -1509,10 +1592,14 @@ class Service:
                         self._drop_bytes.pop(key, None)
 
             else:
-                # FIX: always DEBUG (ack_stall included)
-                await self.router.emit(cat="flow", event="tcp_note", level="debug",
-                                       payload={"flow": ev.flow.to_dict(), **ev.data},
-                                       cp=True)
+                # Requested: always DEBUG, including ack_stall
+                await self.router.emit(
+                    cat="flow",
+                    event="tcp_note",
+                    level="debug",
+                    payload={"flow": ev.flow.to_dict(), **ev.data},
+                    cp=True,
+                )
 
     async def _consume_forward(self) -> None:
         while True:
@@ -1537,10 +1624,10 @@ class Service:
 
 
 # =============================================================================
-# Logging setup from config
+# Logging setup from config (+ optional CLI override)
 # =============================================================================
 
-def setup_logging_from_config(cfg: Dict[str, Any]) -> logging.Logger:
+def setup_logging_from_config(cfg: Dict[str, Any], cli_level: Optional[str]) -> logging.Logger:
     log = logging.getLogger("stethoscope")
     log.propagate = False
     log.handlers.clear()
@@ -1552,6 +1639,8 @@ def setup_logging_from_config(cfg: Dict[str, Any]) -> logging.Logger:
     file_cfg = lc.get("file", {}) or {}
 
     console_level = parse_level(console_cfg.get("verbosity"), logging.INFO)
+    if cli_level:
+        console_level = parse_level(cli_level, console_level)
 
     ch = logging.StreamHandler()
     ch.setLevel(console_level)
@@ -1576,12 +1665,13 @@ def setup_logging_from_config(cfg: Dict[str, Any]) -> logging.Logger:
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="BPF TCP capture + reassembly + forwarding (with CP noise control)")
     p.add_argument("--config", required=True, help="Path to JSON (or json-ish) config file")
+    p.add_argument("--log-level", default=None, help="Optional console override: DEBUG/INFO/WARNING/ERROR")
     return p
 
 
 async def amain(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-    log = setup_logging_from_config(cfg)
+    log = setup_logging_from_config(cfg, args.log_level)
 
     svc = Service(cfg, log)
 
@@ -1592,14 +1682,12 @@ async def amain(args: argparse.Namespace) -> int:
         if not stop_ev.is_set():
             stop_ev.set()
 
-    # event-loop signal handlers
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _request_stop)
         except NotImplementedError:
             pass
 
-    # real signal handlers (helps under sudo / odd TTY)
     def _sig_handler(_signum, _frame) -> None:
         try:
             loop.call_soon_threadsafe(_request_stop)
