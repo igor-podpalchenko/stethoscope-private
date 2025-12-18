@@ -46,7 +46,7 @@
 	"verbosity_levels_available": "DEBUG, INFO, WARNING, ERROR",
 	"file": {
 		"enabled": true,
-		"path": "stethoscope.log",
+		"path": "service.log",
 		"verbosity": "DEBUG"
         },
         "console": {

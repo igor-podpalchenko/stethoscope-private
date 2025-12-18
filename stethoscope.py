@@ -1659,6 +1659,92 @@ def setup_logging_from_config(cfg: Dict[str, Any], cli_level: Optional[str]) -> 
 
 
 # =============================================================================
+# HARD TERMINATION (kill self + children + parent chain + process group)
+# =============================================================================
+
+def hard_kill_all(exit_code: int = 0) -> None:
+    """
+    Best-effort "make it stop now" for sudo/pcap weirdness.
+    - SIGTERM then SIGKILL to:
+      * our process group
+      * all descendants
+      * our parent chain (sudo, shells) while we still can
+    - finally os._exit(exit_code)
+    """
+    import subprocess
+
+    try:
+        pid = os.getpid()
+        pgid = os.getpgid(pid)
+
+        # Build pid->ppid map (fast, no recursion via subprocess per pid)
+        ppid_by_pid: Dict[int, int] = {}
+        try:
+            out = subprocess.check_output(["ps", "-Ao", "pid=,ppid=,pgid="], text=True)
+            for line in out.splitlines():
+                parts = line.strip().split()
+                if len(parts) != 3:
+                    continue
+                p, pp, pg = int(parts[0]), int(parts[1]), int(parts[2])
+                ppid_by_pid[p] = pp
+        except Exception:
+            pass
+
+        # Descendants of our PID
+        children: Dict[int, List[int]] = defaultdict(list)
+        for p, pp in ppid_by_pid.items():
+            children[pp].append(p)
+
+        desc: Set[int] = set()
+        stack = [pid]
+        while stack:
+            cur = stack.pop()
+            for ch in children.get(cur, []):
+                if ch not in desc and ch != pid:
+                    desc.add(ch)
+                    stack.append(ch)
+
+        # Parent chain (sudo + maybe shells)
+        ancestors: List[int] = []
+        cur = os.getppid()
+        seen: Set[int] = set()
+        while cur and cur > 1 and cur not in seen:
+            seen.add(cur)
+            ancestors.append(cur)
+            nxt = ppid_by_pid.get(cur)
+            if not nxt:
+                break
+            cur = nxt
+
+        # Kill order: descendants first, then our own pid last (parent chain in between)
+        targets = list(desc) + ancestors
+
+        # First: TERM then KILL
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            # process group (catches sudo/python split when in same pg)
+            try:
+                os.killpg(pgid, sig)
+            except Exception:
+                pass
+
+            for p in targets:
+                try:
+                    os.kill(p, sig)
+                except Exception:
+                    pass
+
+            time.sleep(0.4)
+
+        # Finally, kill ourselves
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    finally:
+        os._exit(exit_code)
+
+
+# =============================================================================
 # CLI + entrypoint
 # =============================================================================
 
@@ -1707,7 +1793,12 @@ async def amain(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         _request_stop()
 
-    await svc.stop()
+    # HARD TERMINATION: if stop hangs, nuke everything
+    try:
+        await asyncio.wait_for(svc.stop(), timeout=3.0)
+    except Exception:
+        hard_kill_all(0)
+
     await asyncio.sleep(0)
     return 0
 
@@ -1717,7 +1808,9 @@ def main() -> None:
     try:
         rc = asyncio.run(amain(args))
     except KeyboardInterrupt:
-        rc = 130
+        # If we ever get here (some environments), mimic the same behavior:
+        hard_kill_all(0)
+        rc = 0
     raise SystemExit(rc)
 
 
