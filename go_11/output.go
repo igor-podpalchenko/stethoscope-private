@@ -66,7 +66,18 @@ func (tw *TargetWriter) TryWrite(data []byte, maxBufferBytes int64) (ok bool, re
 		tw.pending.Add(int64(len(data)))
 		return true, "ok"
 	default:
-		return false, "backpressure"
+		// Allow a brief wait for the writer to drain instead of immediately dropping.
+		timer := time.NewTimer(5 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case tw.sendCh <- data:
+			tw.pending.Add(int64(len(data)))
+			return true, "ok"
+		case <-tw.closeCh:
+			return false, "closing"
+		case <-timer.C:
+			return false, "backpressure"
+		}
 	}
 }
 
