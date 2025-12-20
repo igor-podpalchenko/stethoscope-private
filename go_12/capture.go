@@ -42,7 +42,6 @@ func (c *Capture) Start() error {
 	c.assembler = tcpassembly.NewAssembler(pool)
 	c.assembler.MaxBufferedPagesTotal = 0
 
-
 	handle, err := pcap.OpenLive(c.cfg.Iface, 65535, true, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("open pcap: %w", err)
