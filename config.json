@@ -25,10 +25,14 @@
             },
 	    "pcap": {
         	"enabled": true,
+        	"per_session": true,
+                "close_on_fin": true,
+                "sync": false,
         	"dir": "tcpdumps/",
         	"format": "pcapng",
-        	"per_session": true,
-        	"queue_size": 20000
+        	"queue_size": 20000,
+                "fin_close_grace_sec": 0.5,
+		"idle_close_sec": 15
       	    }
 	},
 	"input": {
@@ -40,7 +44,9 @@
 		"_local_ip": "100.79.85.9",
 		"remote_ip": "192.168.5.110",
 		"remote_port": 5000,
-		"_local_port": 56221
+		"_local_port": 56221,
+  		"linktype": "ethernet",
+		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll"
     	    }
 	}
     },

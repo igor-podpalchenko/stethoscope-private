@@ -59,3 +59,24 @@ Linux host + Docker (native Linux)
 Capabilities: packet sniffing usually needs CAP_NET_RAW (and often CAP_NET_ADMIN depending on how you attach / what you do).
 Docker defaults may block things if you’re not privileged.
 
+
+
+# If the PCAP header says “Ethernet” but the bytes are actually RAW IP (common on utun*) or NULL/LOOP (BSD loopback).
+
+capinfos tcpdumps/192.168.5.38_63673__192.168.5.110_5000__1766190094578__1766190133028__service_stop.pcapng
+
+# Check matching by ACK
+tshark  -Y "tcp.flags.ack==1" -c 100 -r tcpdumps/192.168.5.38_63673__192.168.5.110_5000__1766190094578__1766190133028__service_stop.pcapng 
+
+# Extract body as files
+tshark -r tcpdumps/your.pcapng \
+  -o tcp.desegment_tcp_streams:TRUE \
+  -o http.desegment_body:TRUE \
+  -o http.dechunk_body:TRUE \
+  -o http.decompress_body:TRUE \
+  --export-objects http,out_http
+
+
+# Get all requests from tcp stream
+tshark -r tcpdumps/192.168.5.38_63673__192.168.5.110_5000__1766190094578__1766190133028__service_stop.pcapng -Y "http.request" -T fields   -e tcp.stream -e http.host -e http.request.uri | head
+tshark -r tcpdumps/192.168.5.38_63843__192.168.5.110_5000__1766190896080__1766190935650__service_stop.pcapng -Y "http.request" -T fields   -e tcp.stream -e http.host -e http.request.uri | head

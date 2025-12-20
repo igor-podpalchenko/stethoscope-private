@@ -1036,11 +1036,15 @@ class PcapSink:
         fmt: str,
         per_session: bool,
         queue_size: int,
+        sync: bool = False,
         local_ip: str,
         remote_ip: str,
         remote_port: int,
         idle_close_sec: float,
+        close_on_fin: bool = True,
+        fin_close_grace_sec: float = 1.0,
         log: logging.Logger,
+        linktype: Optional[Any] = None,
         pcap_sink: Optional['PcapSink'] = None,
     ) -> None:
         self.enabled = bool(enabled)
@@ -1055,6 +1059,7 @@ class PcapSink:
             self.fmt = "pcapng"
 
         self.per_session = bool(per_session)
+        self.sync = bool(sync)
         self.queue_size = clamp_int(queue_size, default=20000, lo=1000, hi=5_000_000)
 
         self.local_ip = local_ip
@@ -1062,6 +1067,31 @@ class PcapSink:
         self.remote_port = int(remote_port or 0)
 
         self.idle_close_sec = float(idle_close_sec or 0.0)
+
+        self.close_on_fin = bool(close_on_fin) if self.per_session else False
+        self.fin_close_grace_sec = float(fin_close_grace_sec or 0.0)
+
+        # Optional: force pcap linktype (DLT) to avoid wrong decoding in tools like Zeek.
+        # Accepts int DLT number or strings: ethernet|en10mb|raw|ip|null|loopback|linux_sll|sll
+        self._force_linktype: Optional[int] = None
+        if linktype is not None:
+            try:
+                if isinstance(linktype, int):
+                    self._force_linktype = int(linktype)
+                else:
+                    s = str(linktype).strip().lower()
+                    _map = {
+                        "ether": 1, "ethernet": 1, "en10mb": 1, "dlt_en10mb": 1,
+                        "raw": 12, "ip": 12, "dlt_raw": 12,
+                        "null": 0, "loop": 0, "loopback": 0, "dlt_null": 0,
+                        "linux_sll": 113, "sll": 113, "dlt_linux_sll": 113,
+                    }
+                    if s in _map:
+                        self._force_linktype = int(_map[s])
+                    elif s.isdigit():
+                        self._force_linktype = int(s)
+            except Exception:
+                self._force_linktype = None
         self.log = log
 
         self._q: "queue.Queue[Tuple[float, FlowKey, Any]]" = queue.Queue(maxsize=self.queue_size)
@@ -1107,6 +1137,9 @@ class PcapSink:
         fmt = pc.get("format", "pcapng")
         per_session = bool(pc.get("per_session", True))
         queue_size = pc.get("queue_size", 20000)
+        sync = bool(pc.get("sync", False))
+        close_on_fin = bool(pc.get("close_on_fin", True))
+        fin_grace = pc.get("fin_close_grace_sec", 1.0)
         idle = pc.get("idle_close_sec", None)
         if idle is None:
             idle = idle_close_sec
@@ -1117,10 +1150,12 @@ class PcapSink:
             fmt=str(fmt),
             per_session=per_session,
             queue_size=int(queue_size or 20000),
+            sync=sync,
             local_ip=local_ip,
             remote_ip=remote_ip,
             remote_port=remote_port,
             idle_close_sec=float(idle or 0.0),
+            linktype=pc.get("linktype", pc.get("dlt", None)),
             log=log,
         )
 
@@ -1176,13 +1211,61 @@ class PcapSink:
 
     # ---- internals -----------------------------------------------------------
 
+    
     def _pick_linktype(self, pkt: Any) -> int:
-        """Best-effort linktype detection for pcap header."""
-        # Common libpcap DLT values:
-        #  1  = EN10MB (Ethernet)
-        # 12  = RAW (raw IP)
-        #  0  = NULL/LOOP (BSD loopback)
-        # 113 = LINUX_SLL (Linux cooked capture v1)
+        """Best-effort linktype detection for pcap header.
+
+        Zeek/Zui (and tshark) need the pcap header's linktype (DLT_*) to match the bytes written.
+        On macOS, captures on utun/lo can be RAW IP or NULL/LOOP, while en* is usually Ethernet.
+
+        Common libpcap DLT values:
+          1   = EN10MB (Ethernet)
+          12  = RAW (raw IP)
+          0   = NULL/LOOP (BSD loopback)
+          113 = LINUX_SLL (Linux cooked capture v1)
+        """
+        try:
+            b = bytes(pkt)
+        except Exception:
+            b = b""  # type: ignore[assignment]
+
+        # 1) BSD NULL/LOOP: 4-byte address family, then IP.
+        # AF_INET=2, AF_INET6 is commonly 24 or 30 depending on platform.
+        if len(b) >= 8:
+            if b[:4] in (b"\x02\x00\x00\x00", b"\x00\x00\x00\x02",
+                         b"\x18\x00\x00\x00", b"\x00\x00\x00\x18",
+                         b"\x1e\x00\x00\x00", b"\x00\x00\x00\x1e"):
+                ver = b[4] >> 4
+                if ver in (4, 6):
+                    return 0
+
+        # 2) RAW IP: first nibble is version (4 or 6)
+        if len(b) >= 1:
+            ver = b[0] >> 4
+            if ver in (4, 6):
+                return 12
+
+        # 3) Ethernet: Ethertype at bytes 12..14 (or VLAN tagged)
+        if len(b) >= 14:
+            et = b[12:14]
+            # VLAN tag (0x8100 or 0x88a8): actual ethertype at 16..18
+            if et in (b"\x81\x00", b"\x88\xa8") and len(b) >= 18:
+                et2 = b[16:18]
+                if et2 in (b"\x08\x00", b"\x86\xdd"):
+                    return 1
+                return 1
+            if et in (b"\x08\x00", b"\x86\xdd", b"\x81\x00", b"\x88\xa8"):
+                return 1
+
+        # 4) Linux cooked capture v1 (SLL): protocol/ethertype at 14..16
+        if len(b) >= 16:
+            proto = b[14:16]
+            if proto in (b"\x08\x00", b"\x86\xdd"):
+                # Packet type field is first 2 bytes, usually 0..4
+                if b[0] == 0 and b[1] in (0, 1, 2, 3, 4):
+                    return 113
+
+        # 5) Fall back to scapy's top-level class when available
         top = getattr(pkt, "__class__", type("x", (), {})).__name__
         if top == "Ether":
             return 1
@@ -1190,13 +1273,8 @@ class PcapSink:
             return 113
         if top in ("Null", "Loopback"):
             return 0
-        # If we see an IP layer and no obvious L2, assume raw IP
-        try:
-            if hasattr(pkt, "getlayer") and pkt.getlayer(IP) is not None and (Ether is None or pkt.getlayer(Ether) is None):
-                return 12
-        except Exception:
-            pass
         return 1
+
 
     def _flow_file_base(self, flow: FlowKey) -> str:
         def _clean(s: str) -> str:
@@ -1210,7 +1288,7 @@ class PcapSink:
         fname = f"{base}__{start_ms}__open.{ext}"
         path = os.path.join(self.out_dir, fname)
 
-        linktype = self._pick_linktype(pkt)
+        linktype = self._force_linktype if getattr(self, '_force_linktype', None) is not None else self._pick_linktype(pkt)
 
         try:
             # scapy writers have some version variance; keep it simple.
@@ -1220,10 +1298,10 @@ class PcapSink:
 
             # Prefer append=False: create new file
             try:
-                w = cls(path, append=False, sync=False, linktype=linktype)  # type: ignore[arg-type]
+                w = cls(path, append=False, sync=self.sync, linktype=linktype)  # type: ignore[arg-type]
             except TypeError:
                 try:
-                    w = cls(path, append=False, sync=False)  # type: ignore[arg-type]
+                    w = cls(path, append=False, sync=self.sync)  # type: ignore[arg-type]
                     try:
                         setattr(w, "linktype", linktype)
                     except Exception:
@@ -1290,6 +1368,33 @@ class PcapSink:
             b = bytes(pkt)
             self._pkts_written += 1
             self._bytes_written += len(b)
+
+            # Optional early close handling (FIN/RST) for per-session files.
+            if self.close_on_fin and self.per_session:
+                try:
+                    if pkt is not None and pkt.haslayer(TCP):  # type: ignore[attr-defined]
+                        flags = int(pkt[TCP].flags)  # type: ignore[index]
+                        # RST closes immediately
+                        if flags & 0x04:
+                            meta["close_now"] = ("rst", float(ts_epoch))
+                        # FIN closes after both sides seen (with small grace)
+                        if flags & 0x01:
+                            src = None
+                            try:
+                                if pkt.haslayer(IP):  # type: ignore[attr-defined]
+                                    src = str(pkt[IP].src)  # type: ignore[index]
+                            except Exception:
+                                src = None
+                            if src == self.local_ip:
+                                meta["fin_local"] = True
+                            else:
+                                meta["fin_remote"] = True
+                            if meta.get("fin_local") and meta.get("fin_remote"):
+                                meta["close_reason"] = "fin"
+                                meta["close_after"] = float(ts_epoch) + max(0.0, float(self.fin_close_grace_sec))
+                except Exception:
+                    # Never let close-detection break writing
+                    pass
             meta["last_ts"] = ts_epoch
             return True
         except Exception as e:
@@ -1338,6 +1443,24 @@ class PcapSink:
 
                 if meta is not None:
                     self._write_one(meta, pkt, ts_epoch)
+
+                    # If per-session writer observed FIN/RST, close promptly (after grace).
+                    if self.per_session:
+                        try:
+                            cn = meta.get("close_now", None)
+                            ca = meta.get("close_after", None)
+                            if cn is not None:
+                                reason, tclose = cn
+                                meta2 = self._writers.pop(key, None)
+                                if meta2 is not None:
+                                    self._close_writer(key, meta2, reason=str(reason), ts_epoch=float(tclose))
+                            elif ca is not None and float(now) >= float(ca):
+                                reason = meta.get("close_reason", "fin")
+                                meta2 = self._writers.pop(key, None)
+                                if meta2 is not None:
+                                    self._close_writer(key, meta2, reason=str(reason), ts_epoch=float(ca))
+                        except Exception:
+                            pass
 
             # Periodic idle close
             if now >= next_gc:
