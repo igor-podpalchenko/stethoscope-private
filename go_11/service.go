@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+const (
+	defaultStartupBufferBytes = 64 * 1024
+	maxStartupBufferBytes     = 64 * 1024 * 1024
+)
+
 type dropKey struct {
 	sessionID int
 	stream    string
@@ -141,7 +146,11 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 	if ackStallAny != nil {
 		ackStall = time.Duration(ToFloat64(ackStallAny, 0) * float64(time.Second))
 	}
-	startupBuf := ClampInt(capCfg["buffer_bytes"], 65536, 0, 65536)
+	// Respect configured startup buffer size (per session across directions) while
+	// capping to a generous ceiling to avoid unbounded memory growth. The previous
+	// hard cap at 64 KiB ignored larger configs and led to avoidable
+	// startup_buffer_full drops when outputs connected slowly.
+	startupBuf := ClampInt(capCfg["buffer_bytes"], defaultStartupBufferBytes, 0, maxStartupBufferBytes)
 
 	ctrl := GetMap(cfg, "control")
 	controlBindIP := strings.TrimSpace(fmt.Sprintf("%v", ctrl["bind_ip"]))

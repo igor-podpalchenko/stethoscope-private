@@ -1955,7 +1955,19 @@ class Service:
         # Startup (pre-output-connect) per-session buffering to avoid dropping early bytes
         # - Total per TCP session across both directions
         # - 0 disables buffering
-        self.startup_buffer_bytes = clamp_int(cap.get("buffer_bytes", 65536), default=65536, lo=0, hi=65536)
+        #
+        # Previously we hard-capped the configured buffer to 64 KiB, which ignored
+        # larger settings and caused avoidable startup_buffer_full drops. Respect the
+        # configured value while keeping a generous safety ceiling to avoid runaway
+        # memory use.
+        default_startup_buf = 65536
+        max_startup_buf = 64 * 1024 * 1024  # 64 MiB per session upper bound
+        self.startup_buffer_bytes = clamp_int(
+            cap.get("buffer_bytes", default_startup_buf),
+            default=default_startup_buf,
+            lo=0,
+            hi=max_startup_buf,
+        )
         ack_stall_sec = get_path(cfg, "io.output.listner.timeouts.ack_stall_sec", None)
         self.ack_stall_sec = float(ack_stall_sec) if ack_stall_sec is not None else None
 
