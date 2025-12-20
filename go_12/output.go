@@ -14,13 +14,14 @@ type OutputManager struct {
 	log       Logger
 	requests  *tcpTarget
 	responses *tcpTarget
+	router    *EventRouter
 }
 
-func NewOutputManager(cfg OutputConfig, log Logger) *OutputManager {
-	om := &OutputManager{cfg: cfg, log: log}
+func NewOutputManager(cfg OutputConfig, log Logger, router *EventRouter) *OutputManager {
+	om := &OutputManager{cfg: cfg, log: log, router: router}
 	if cfg.RemoteHost.Enabled {
-		om.requests = newTCPTarget(cfg.RemoteHost.Host, cfg.RemoteHost.RequestsPort, cfg.RemoteHost.Timeouts, log)
-		om.responses = newTCPTarget(cfg.RemoteHost.Host, cfg.RemoteHost.ResponsesPort, cfg.RemoteHost.Timeouts, log)
+		om.requests = newTCPTarget(cfg.RemoteHost.Host, cfg.RemoteHost.RequestsPort, cfg.RemoteHost.Timeouts, log, "requests", router)
+		om.responses = newTCPTarget(cfg.RemoteHost.Host, cfg.RemoteHost.ResponsesPort, cfg.RemoteHost.Timeouts, log, "responses", router)
 	}
 	return om
 }
@@ -52,9 +53,14 @@ type tcpTarget struct {
 	mu      sync.Mutex
 	conn    net.Conn
 	log     Logger
+
+	stream     string
+	router     *EventRouter
+	connected  bool
+	retryEvery time.Duration
 }
 
-func newTCPTarget(host string, port int, t TimeoutConfig, log Logger) *tcpTarget {
+func newTCPTarget(host string, port int, t TimeoutConfig, log Logger, stream string, router *EventRouter) *tcpTarget {
 	timeout := time.Duration(t.Connect) * time.Second
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -64,10 +70,13 @@ func newTCPTarget(host string, port int, t TimeoutConfig, log Logger) *tcpTarget
 		retry = 5 * time.Second
 	}
 	return &tcpTarget{
-		address: fmt.Sprintf("%s:%d", host, port),
-		timeout: timeout,
-		retry:   retry,
-		log:     log,
+		address:    fmt.Sprintf("%s:%d", host, port),
+		timeout:    timeout,
+		retry:      retry,
+		log:        log,
+		stream:     stream,
+		router:     router,
+		retryEvery: retry,
 	}
 }
 
@@ -76,8 +85,9 @@ func (t *tcpTarget) send(ctx context.Context, ch Chunk) {
 	defer t.mu.Unlock()
 
 	if t.conn == nil {
-		if err := t.connectLocked(); err != nil {
+		if err := t.connectLocked(ch.Flow); err != nil {
 			t.log.Warnf("output connect %s failed: %v", t.address, err)
+			t.emitDisconnected(ch.Flow)
 			return
 		}
 	}
@@ -96,18 +106,24 @@ func (t *tcpTarget) send(ctx context.Context, ch Chunk) {
 	t.log.Warnf("output write to %s failed, reconnecting: %v", t.address, err)
 	_ = t.conn.Close()
 	t.conn = nil
+	t.connected = false
+	t.emitDisconnected(ch.Flow)
 
 	// attempt reconnect once
-	if err := t.connectLocked(); err != nil {
+	if err := t.connectLocked(ch.Flow); err != nil {
 		t.log.Warnf("output reconnect %s failed: %v", t.address, err)
+		t.emitDisconnected(ch.Flow)
 		return
 	}
 	if _, err := t.conn.Write(ch.Data); err != nil {
 		t.log.Warnf("output write after reconnect %s failed: %v", t.address, err)
+		t.connected = false
+		t.conn = nil
+		t.emitDisconnected(ch.Flow)
 	}
 }
 
-func (t *tcpTarget) connectLocked() error {
+func (t *tcpTarget) connectLocked(flow Flow) error {
 	if t.address == "" {
 		return fmt.Errorf("missing address")
 	}
@@ -118,7 +134,9 @@ func (t *tcpTarget) connectLocked() error {
 		return err
 	}
 	t.conn = conn
+	t.connected = true
 	t.log.Infof("connected to %s", t.address)
+	t.emitConnected(flow)
 	return nil
 }
 
@@ -129,4 +147,46 @@ func (t *tcpTarget) Close() {
 		_ = t.conn.Close()
 		t.conn = nil
 	}
+}
+
+func (t *tcpTarget) flowPayload(flow Flow) map[string]any {
+	if flow == (Flow{}) {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"src_ip":   flow.SrcIP,
+		"src_port": flow.SrcPort,
+		"dst_ip":   flow.DstIP,
+		"dst_port": flow.DstPort,
+	}
+}
+
+func (t *tcpTarget) emitConnected(flow Flow) {
+	if t.router == nil {
+		return
+	}
+	payload := map[string]any{
+		"peer":   t.address,
+		"stream": t.stream,
+	}
+	if fp := t.flowPayload(flow); len(fp) > 0 {
+		payload["flow"] = fp
+	}
+	t.router.Emit("output", "connector_connected", "info", payload, true)
+}
+
+func (t *tcpTarget) emitDisconnected(flow Flow) {
+	if t.router == nil || !t.connected {
+		return
+	}
+	t.connected = false
+	payload := map[string]any{
+		"peer":            t.address,
+		"stream":          t.stream,
+		"retry_every_sec": int(t.retryEvery.Seconds()),
+	}
+	if fp := t.flowPayload(flow); len(fp) > 0 {
+		payload["flow"] = fp
+	}
+	t.router.Emit("output", "connector_disconnected", "warning", payload, true)
 }
