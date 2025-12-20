@@ -25,6 +25,7 @@ type pcapWriterMeta struct {
 	base     string
 	start    time.Time
 	linkType layers.LinkType
+	lastWarn time.Time
 }
 
 type pcapItem struct {
@@ -195,10 +196,27 @@ func (p *PcapSink) writeOne(meta *pcapWriterMeta, item pcapItem) bool {
 	if meta == nil || meta.writer == nil {
 		return false
 	}
-	if err := meta.writer.WritePacket(item.ci, item.data); err != nil {
+	ci := item.ci
+	if ci.Timestamp.IsZero() {
+		ci.Timestamp = time.Now()
+	}
+	// Ensure lengths are consistent with the data we're writing. Some packet sources
+	// (or gopacket decoders) may leave CaptureLength/Length at zero, which causes
+	// pcapgo writers to reject the write and return an error. Since we are writing
+	// the exact captured bytes, force both lengths to match the payload size.
+	ci.CaptureLength = len(item.data)
+	ci.Length = len(item.data)
+	ci.InterfaceIndex = 0
+
+	if err := meta.writer.WritePacket(ci, item.data); err != nil {
 		p.statsMu.Lock()
 		p.stats.PktsFailed++
 		p.statsMu.Unlock()
+		// Throttle warnings per file to avoid log spam.
+		if meta.lastWarn.IsZero() || time.Since(meta.lastWarn) >= 5*time.Second {
+			meta.lastWarn = time.Now()
+			p.log.Warnf("pcap write failed path=%s err=%v", meta.path, err)
+		}
 		return false
 	}
 	p.statsMu.Lock()
