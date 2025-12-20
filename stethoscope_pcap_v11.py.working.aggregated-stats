@@ -1082,7 +1082,6 @@ class PcapSink:
         local_ip: str,
         remote_ip: str,
         remote_port: int,
-        idle_close_sec: float,
         close_on_fin: bool = True,
         fin_close_grace_sec: float = 1.0,
         log: logging.Logger,
@@ -1107,8 +1106,6 @@ class PcapSink:
         self.local_ip = local_ip
         self.remote_ip = remote_ip
         self.remote_port = int(remote_port or 0)
-
-        self.idle_close_sec = float(idle_close_sec or 0.0)
 
         self.close_on_fin = bool(close_on_fin) if self.per_session else False
         self.fin_close_grace_sec = float(fin_close_grace_sec or 0.0)
@@ -1167,12 +1164,12 @@ class PcapSink:
             self.log.warning("pcap output disabled: scapy PcapWriter/PcapNgWriter not available")
 
     @staticmethod
-    def from_cfg(cfg: Dict[str, Any], *, local_ip: str, remote_ip: str, remote_port: int, idle_close_sec: float, log: logging.Logger) -> "PcapSink":
+    def from_cfg(cfg: Dict[str, Any], *, local_ip: str, remote_ip: str, remote_port: int, log: logging.Logger) -> "PcapSink":
         pc = get_path(cfg, "io.output.pcap", None)
         if not isinstance(pc, dict):
             return PcapSink(enabled=False, out_dir="", fmt="pcap", per_session=False, queue_size=1,
                             local_ip=local_ip, remote_ip=remote_ip, remote_port=remote_port,
-                            idle_close_sec=0.0, log=log)
+                            log=log)
 
         enabled = bool(pc.get("enabled", False))
         out_dir = pc.get("dir", None) or pc.get("path", None) or ""
@@ -1182,7 +1179,6 @@ class PcapSink:
         sync = bool(pc.get("sync", False))
         close_on_fin = bool(pc.get("close_on_fin", True))
         fin_grace = pc.get("fin_close_grace_sec", 1.0)
-        idle = 0.0  # idle_close_sec disabled for PCAP to preserve full TCP sessions (incl SYN)
 
         return PcapSink(
             enabled=enabled,
@@ -1194,7 +1190,8 @@ class PcapSink:
             local_ip=local_ip,
             remote_ip=remote_ip,
             remote_port=remote_port,
-            idle_close_sec=float(idle or 0.0),
+            close_on_fin=close_on_fin,
+            fin_close_grace_sec=float(fin_grace or 1.0),
             linktype=pc.get("linktype", pc.get("dlt", None)),
             log=log,
         )
@@ -1476,8 +1473,6 @@ class PcapSink:
             return False
 
     def _run(self) -> None:
-        # Opportunistic cleanup cadence
-        next_gc = time.time() + 1.0
 
         while not self._stop.is_set():
             now = time.time()
@@ -1530,21 +1525,6 @@ class PcapSink:
                                     self._close_writer(key, meta2, reason=str(reason), ts_epoch=float(ca))
                         except Exception:
                             pass
-
-            # Periodic idle close
-            if now >= next_gc:
-                next_gc = now + 1.0
-                if self.idle_close_sec and self.idle_close_sec > 0:
-                    to_close: List[Any] = []
-                    for key, meta in list(self._writers.items()):
-                        last_ts = float(meta.get("last_ts", 0.0))
-                        if now - last_ts >= self.idle_close_sec:
-                            to_close.append(key)
-                    for key in to_close:
-                        meta = self._writers.pop(key, None)
-                        if meta is not None:
-                            self._close_writer(key, meta, reason=f"idle_timeout_{int(self.idle_close_sec)}s", ts_epoch=now)
-
         # Final close
         now = time.time()
         for key, meta in list(self._writers.items()):
@@ -1606,21 +1586,6 @@ class OutputManager:
         self.max_output_buffer = ensure_int(rt, "max_output_buffer_bytes", 1_000_000)
         self.drain_timeout_ms = ensure_int(rt, "drain_timeout_ms", 0)
 
-
-        cap = get_path(cfg, "io.input.capture", {}) or {}
-        pb = ensure_int(cap, "prebuffer_bytes", 65536)
-        if pb < 0:
-            pb = 0
-        if pb > 65536:
-            pb = 65536
-        self.prebuffer_limit_bytes = pb
-
-        # Pre-buffer for newly opened TCP sessions so we don't drop early bytes while output sockets
-        # are still being established. Buffer is per TCP session (shared across directions/streams).
-        self._prebuffer: Dict[Tuple[int, str], deque] = {}
-        self._prebuffer_total_bytes: DefaultDict[int, int] = defaultdict(int)
-        self._prebuffer_ready: Set[Tuple[int, str]] = set()
-
         # listener mode
         self.listener_cfg: Dict[str, Any] = get_path(cfg, "io.output.listner", {}) or {}
         self.listener_enabled = bool(self.listener_cfg.get("enabled", False))
@@ -1652,6 +1617,21 @@ class OutputManager:
             return "requests" if direction == "c2s" else "responses"
         return "responses" if direction == "c2s" else "requests"
 
+    def has_active_targets(self, flow: FlowKey, direction: str) -> bool:
+        """Return True if there is at least one currently-connected output target for this stream."""
+        so = self.sessions.get(flow)
+        if so is None:
+            return False
+        stream = self.map_stream(direction)
+        for tw in so.all_targets_for(stream):
+            try:
+                if tw is not None and not tw.is_closing():
+                    return True
+            except Exception:
+                # Defensive: treat weird transports as not-ready
+                pass
+        return False
+
     async def ensure_session(self, flow: FlowKey) -> SessionOutputs:
         async with self._lock:
             so = self.sessions.get(flow)
@@ -1679,14 +1659,6 @@ class OutputManager:
             return so
 
     async def close_session(self, flow: FlowKey, reason: str) -> None:
-
-        session_id = flow.session_id
-        # Drop any buffered data for this session (both directions)
-        for stream in ("requests", "responses"):
-            key = (session_id, stream)
-            self._prebuffer.pop(key, None)
-            self._prebuffer_ready.discard(key)
-        self._prebuffer_total_bytes.pop(session_id, None)
         async with self._lock:
             so = self.sessions.pop(flow, None)
         if not so:
@@ -1848,125 +1820,74 @@ class OutputManager:
 
             await asyncio.sleep(self.conn_retry_every)
 
-    async def write_chunk(self, flow: FlowKey, direction: str, data: bytes) -> Tuple[int, int, str, int, int, int, int]:
+    async def write_chunk(self, flow: FlowKey, direction: str, data: bytes) -> Tuple[int, int, str, int]:
         """
         Forward reassembled stream bytes to all configured targets for mapped stream.
-
-        Adds a small per-session prebuffer (shared across directions) so newly opened sessions
-        don't lose their first bytes while output sockets are still being established.
+        Drops if no targets or backpressure.
         """
         if not data:
-            return (0, 0, "empty", 0, 0, 0, 0)
+            return (0, 0, "empty", 0)
 
-        session_id = flow.session_id
         so = await self.ensure_session(flow)
         stream = self.map_stream(direction)
-        key = (session_id, stream)
+        targets = so.all_targets_for(stream)
 
-        # Helper: send one payload to current targets, applying the same backpressure rules.
-        async def _send_one(payload: bytes) -> Tuple[int, int, Set[str], int]:
-            targets = so.all_targets_for(stream)
-            if not targets:
-                return (0, len(payload), {"no_targets"}, 0)
+        if not targets:
+            return (0, len(data), "no_targets", 0)
 
-            sent = 0
-            dropped = 0
-            drop_reasons: Set[str] = set()
+        sent = 0
+        dropped = 0
+        reason = "ok"
 
-            for t in targets:
+        sent_targets = 0
+        dropped_targets = 0
+        drop_reasons = set()
+
+        for tw in targets:
+            if tw.is_closing():
+                dropped += len(data)
+                dropped_targets += 1
+                drop_reasons.add("closing")
+                continue
+            if tw.buffer_size() > self.max_output_buffer:
+                dropped += len(data)
+                dropped_targets += 1
+                drop_reasons.add("backpressure")
+                continue
+            try:
+                tw.writer.write(data)
+                if self.drain_timeout_ms > 0:
+                    try:
+                        await asyncio.wait_for(tw.writer.drain(), timeout=self.drain_timeout_ms / 1000.0)
+                    except asyncio.TimeoutError:
+                        # Intentionally do not block indefinitely.
+                        pass
+                sent += len(data)
+                sent_targets += 1
+            except Exception:
+                dropped += len(data)
+                dropped_targets += 1
+                drop_reasons.add("write_error")
                 try:
-                    t.w.write(payload)
-
-                    # Backpressure guard: if we can't drain in time, drop this target for this session/stream.
-                    # This avoids one stuck listener stalling everything.
-                    if self.drain_timeout_ms and self.drain_timeout_ms > 0:
-                        try:
-                            await asyncio.wait_for(t.w.drain(), timeout=self.drain_timeout_ms / 1000.0)
-                        except asyncio.TimeoutError:
-                            dropped += len(payload)
-                            drop_reasons.add("backpressure")
-                            await so.drop_target(stream, t)
-                            continue
-                    else:
-                        await t.w.drain()
-
-                    sent += len(payload)
-                except (BrokenPipeError, ConnectionResetError):
-                    dropped += len(payload)
-                    drop_reasons.add("broken_pipe")
-                    await so.drop_target(stream, t)
+                    tw.writer.close()
                 except Exception:
-                    dropped += len(payload)
-                    drop_reasons.add("send_error")
-                    await so.drop_target(stream, t)
+                    pass
 
-            return (sent, dropped, drop_reasons, len(targets))
+        if dropped:
+            # If at least one target got the chunk, this is a *partial* drop.
+            # Make that visible in stats to reduce confusion ("my listener got everything, why drops?").
+            if sent_targets:
+                reason = "partial:" + ",".join(sorted(drop_reasons)) if drop_reasons else "partial:drop"
+            else:
+                reason = ",".join(sorted(drop_reasons)) if drop_reasons else "drop"
 
-        targets_now = so.all_targets_for(stream)
+        return (sent, dropped, reason, len(targets))
 
-        # No targets yet: optionally buffer, otherwise drop (old behavior).
-        if not targets_now:
-            if self.prebuffer_limit_bytes > 0 and key not in self._prebuffer_ready:
-                total = self._prebuffer_total_bytes[session_id]
-                if total + len(data) <= self.prebuffer_limit_bytes:
-                    q = self._prebuffer.get(key)
-                    if q is None:
-                        q = deque()
-                        self._prebuffer[key] = q
-                    q.append(data)
-                    self._prebuffer_total_bytes[session_id] = total + len(data)
-                    return (0, 0, "buffered", 0, 0, 0, 1)
 
-            return (0, len(data), "no_targets", 0, 0, 1, 0)
 
-        # Targets are present for this stream: mark ready and flush any buffered payloads first.
-        self._prebuffer_ready.add(key)
-
-        sent_total = 0
-        dropped_total = 0
-        drop_reasons_total: Set[str] = set()
-        chunks_sent = 0
-        chunks_dropped = 0
-        chunks_buffered = 0
-
-        q = self._prebuffer.pop(key, None)
-        if q:
-            while q:
-                payload = q.popleft()
-                self._prebuffer_total_bytes[session_id] -= len(payload)
-
-                s, d, rs, _tc = await _send_one(payload)
-                sent_total += s
-                dropped_total += d
-                drop_reasons_total |= rs
-                if s:
-                    chunks_sent += 1
-                if d:
-                    chunks_dropped += 1
-
-            if self._prebuffer_total_bytes[session_id] <= 0:
-                self._prebuffer_total_bytes.pop(session_id, None)
-
-        # Send current payload.
-        s, d, rs, targets_count = await _send_one(data)
-        sent_total += s
-        dropped_total += d
-        drop_reasons_total |= rs
-        if s:
-            chunks_sent += 1
-        if d:
-            chunks_dropped += 1
-
-        # Construct an informative reason (compatible-ish with previous behavior).
-        if dropped_total == 0:
-            reason = "ok"
-        elif sent_total == 0:
-            reason = ",".join(sorted(drop_reasons_total)) if drop_reasons_total else "drop"
-        else:
-            # Partial: at least one target received bytes, at least one target dropped.
-            reason = "partial:" + (",".join(sorted(drop_reasons_total)) if drop_reasons_total else "drop")
-
-        return (sent_total, dropped_total, reason, targets_count, chunks_sent, chunks_dropped, chunks_buffered)
+# =============================================================================
+# Service
+# =============================================================================
 
 class Service:
     def __init__(self, cfg: Dict[str, Any], log: logging.Logger) -> None:
@@ -2031,6 +1952,10 @@ class Service:
         self.capture_queue_size = clamp_int(rt.get("capture_queue_size", 50000), default=50000, lo=1000, hi=5_000_000)
 
         self.session_idle_sec = float(cap.get("session_idle_sec", 120) or 120)
+        # Startup (pre-output-connect) per-session buffering to avoid dropping early bytes
+        # - Total per TCP session across both directions
+        # - 0 disables buffering
+        self.startup_buffer_bytes = clamp_int(cap.get("buffer_bytes", 65536), default=65536, lo=0, hi=65536)
         ack_stall_sec = get_path(cfg, "io.output.listner.timeouts.ack_stall_sec", None)
         self.ack_stall_sec = float(ack_stall_sec) if ack_stall_sec is not None else None
 
@@ -2055,8 +1980,7 @@ class Service:
         self.worker_inqs: List["queue.Queue[PacketInfo]"] = []
         self.workers_threads: List[ReassemblyWorker] = []
         self.capture: Optional[CaptureThread] = None
-        self.pcap_sink: PcapSink = PcapSink.from_cfg(cfg, local_ip=self.local_ip, remote_ip=self.remote_ip, remote_port=self.remote_port,
-                                                     idle_close_sec=self.session_idle_sec, log=log)
+        self.pcap_sink: PcapSink = PcapSink.from_cfg(cfg, local_ip=self.local_ip, remote_ip=self.remote_ip, remote_port=self.remote_port, log=log)
 
         # bookkeeping
         self._sessions: Dict[int, Dict[str, Any]] = {}
@@ -2064,6 +1988,10 @@ class Service:
         self._session_bytes_drop: DefaultDict[int, int] = defaultdict(int)
         self._session_chunks_out: DefaultDict[int, int] = defaultdict(int)
         self._session_chunks_drop: DefaultDict[int, int] = defaultdict(int)
+
+        # Startup buffering state (sid -> state)
+        # state: {"limit": int, "bytes": int, "buf": {"c2s": deque[bytes], "s2c": deque[bytes]}, "active": {"c2s": bool, "s2c": bool}}
+        self._startup_buffers: Dict[int, Dict[str, Any]] = {}
 
         self._drop_count: DefaultDict[Tuple[int, str, str], int] = defaultdict(int)
         self._drop_bytes: DefaultDict[Tuple[int, str, str], int] = defaultdict(int)
@@ -2073,8 +2001,78 @@ class Service:
         self._chunks_forwarded = 0
         self._chunks_dropped = 0
 
-        self.stats_interval_sec = float(get_path(cfg, "runtime.stats_interval_sec", 5) or 5)
+        # Periodic aggregated stats logging interval (seconds). Prefer config.logging.stats.report_interval; fallback runtime.stats_interval_sec.
+        _log_stats = get_path(cfg, "logging.stats", {}) or {}
+        _ri = _log_stats.get("report_interval", None)
+        if _ri is None:
+            _ri = get_path(cfg, "runtime.stats_interval_sec", 5)
+        try:
+            self.stats_interval_sec = float(_ri or 0)
+        except Exception:
+            self.stats_interval_sec = 0.0
+        if self.stats_interval_sec < 0:
+            self.stats_interval_sec = 0.0
         self._tasks: List[asyncio.Task] = []
+
+    def drop_detail_snapshot(self, top_n: int = 16) -> Dict[str, Any]:
+        """Aggregate drop counters across all sessions.
+
+        Returns a compact structure:
+          - total_drops: {count, bytes}
+          - drop_by_why: {reason: {count, bytes}} (top_n by bytes, rest in "__other__")
+          - drop_by_stream: {stream: {count, bytes}}
+        """
+        if not self._drop_count:
+            return {
+                "total_drops": {"count": 0, "bytes": 0},
+                "drop_by_why": {},
+                "drop_by_stream": {},
+            }
+
+        by_reason_cnt: Dict[str, int] = {}
+        by_reason_bytes: Dict[str, int] = {}
+        by_stream_cnt: Dict[str, int] = {}
+        by_stream_bytes: Dict[str, int] = {}
+        total_cnt = 0
+        total_bytes = 0
+
+        for (sid, stream, reason), cnt in self._drop_count.items():
+            b = int(self._drop_bytes.get((sid, stream, reason), 0) or 0)
+            cnt_i = int(cnt or 0)
+            total_cnt += cnt_i
+            total_bytes += b
+
+            by_reason_cnt[reason] = by_reason_cnt.get(reason, 0) + cnt_i
+            by_reason_bytes[reason] = by_reason_bytes.get(reason, 0) + b
+            by_stream_cnt[stream] = by_stream_cnt.get(stream, 0) + cnt_i
+            by_stream_bytes[stream] = by_stream_bytes.get(stream, 0) + b
+
+        # Sort reasons by bytes, keep top_n, fold rest into "__other__"
+        reasons_sorted = sorted(by_reason_bytes.items(), key=lambda kv: kv[1], reverse=True)
+        if top_n > 0 and len(reasons_sorted) > top_n:
+            keep = reasons_sorted[:top_n]
+            rest = reasons_sorted[top_n:]
+            other_bytes = sum(b for _r, b in rest)
+            other_cnt = sum(by_reason_cnt.get(r, 0) for r, _b in rest)
+            reasons_sorted = keep
+            if other_bytes or other_cnt:
+                by_reason_bytes["__other__"] = other_bytes
+                by_reason_cnt["__other__"] = other_cnt
+                reasons_sorted.append(("__other__", other_bytes))
+
+        drop_by_why: Dict[str, Any] = {}
+        for r, _b in reasons_sorted:
+            drop_by_why[r] = {"count": int(by_reason_cnt.get(r, 0)), "bytes": int(by_reason_bytes.get(r, 0))}
+
+        drop_by_stream: Dict[str, Any] = {}
+        for s, _b in sorted(by_stream_bytes.items(), key=lambda kv: kv[1], reverse=True):
+            drop_by_stream[s] = {"count": int(by_stream_cnt.get(s, 0)), "bytes": int(by_stream_bytes.get(s, 0))}
+
+        return {
+            "total_drops": {"count": int(total_cnt), "bytes": int(total_bytes)},
+            "drop_by_why": drop_by_why,
+            "drop_by_stream": drop_by_stream,
+        }
 
     def stats_snapshot(self) -> Dict[str, Any]:
         return {
@@ -2102,6 +2100,157 @@ class Service:
             },
         }
 
+
+    def _account_forward_result(self, *, sid: int, stream: str, sent: int, dropped: int, reason: str) -> None:
+        # Global counters
+        if sent:
+            self._bytes_forwarded += sent
+            self._chunks_forwarded += 1
+            self._session_bytes_out[sid] += sent
+            self._session_chunks_out[sid] += 1
+
+        if dropped:
+            self._bytes_dropped += dropped
+            self._chunks_dropped += 1
+            self._session_bytes_drop[sid] += dropped
+            self._session_chunks_drop[sid] += 1
+
+            key = (sid, stream, reason)
+            self._drop_count[key] += 1
+            self._drop_bytes[key] += dropped
+
+    def _account_local_drop(self, *, sid: int, stream: str, dropped: int, reason: str, chunks: int = 1) -> None:
+        if dropped <= 0:
+            return
+        self._bytes_dropped += dropped
+        self._session_bytes_drop[sid] += dropped
+
+        # Keep semantics similar to OutputManager.write_chunk: one "chunk drop" per event
+        if chunks > 0:
+            self._chunks_dropped += chunks
+            self._session_chunks_drop[sid] += chunks
+            self._drop_count[(sid, stream, reason)] += chunks
+
+        self._drop_bytes[(sid, stream, reason)] += dropped
+
+    def _ensure_startup_buffer_state(self, sid: int) -> Dict[str, Any]:
+        st = self._startup_buffers.get(sid)
+        if st is not None:
+            return st
+        st = {
+            "limit": int(self.startup_buffer_bytes),
+            "bytes": 0,
+            "buf": {"c2s": deque(), "s2c": deque()},
+            "active": {"c2s": True, "s2c": True},
+        }
+        self._startup_buffers[sid] = st
+        return st
+
+    async def _flush_startup_buffer(self, *, flow: FlowKey, direction: str, st: Dict[str, Any]) -> None:
+        # Flush buffered chunks in-order for this direction
+        sid = flow.session_id
+        stream = self.outputs.map_stream(direction)
+        q = st["buf"].get(direction)
+        if not q:
+            st["active"][direction] = False
+            return
+
+        while q:
+            data = q.popleft()
+            try:
+                st["bytes"] -= len(data)
+            except Exception:
+                pass
+            sent, dropped, reason, _targets = await self.outputs.write_chunk(flow, direction, data)
+            self._account_forward_result(sid=sid, stream=stream, sent=sent, dropped=dropped, reason=reason)
+
+        st["active"][direction] = False
+
+    def _discard_startup_buffers(self, *, flow: FlowKey, reason: str) -> None:
+        sid = flow.session_id
+        st = self._startup_buffers.get(sid)
+        if not st:
+            return
+
+        # Discard remaining buffered chunks (typically: no targets ever connected).
+        for direction in ("c2s", "s2c"):
+            q = st["buf"].get(direction)
+            if not q:
+                continue
+            stream = self.outputs.map_stream(direction)
+            dropped_bytes = 0
+            dropped_chunks = 0
+            while q:
+                data = q.popleft()
+                dropped_bytes += len(data)
+                dropped_chunks += 1
+            if dropped_bytes:
+                self._account_local_drop(sid=sid, stream=stream, dropped=dropped_bytes, reason=reason, chunks=dropped_chunks)
+
+        self._startup_buffers.pop(sid, None)
+
+
+
+    async def _flush_startup_buffers_on_close(self, *, flow: FlowKey, reason: str) -> None:
+        """On session close, try hard to flush any startup-buffered bytes before closing outputs.
+
+        This matters for PCAP playback semantics: FIN should not cause us to discard buffered payload
+        just because the listener/connector target attached a bit late.
+        """
+        if self.startup_buffer_bytes <= 0:
+            return
+        sid = flow.session_id
+        st = self._startup_buffers.get(sid)
+        if not st:
+            return
+
+        # Small grace to allow in-flight last chunks to get enqueued/processed.
+        try:
+            close_grace_ms = int(get_path(self.cfg, "runtime.close_grace_ms", 100) or 0)
+        except Exception:
+            close_grace_ms = 100
+        if close_grace_ms > 0:
+            await asyncio.sleep(close_grace_ms / 1000.0)
+
+        # If nothing buffered, clear state and exit.
+        try:
+            buffered = int(st.get("bytes", 0) or 0)
+        except Exception:
+            buffered = 0
+        if buffered <= 0:
+            self._startup_buffers.pop(sid, None)
+            return
+
+        # Wait a bit for targets to appear (listener client connect / connector dial).
+        try:
+            linger_sec = float(get_path(self.cfg, "runtime.close_linger_sec", 2) or 0)
+        except Exception:
+            linger_sec = 2.0
+        if linger_sec < 0:
+            linger_sec = 0.0
+        deadline = monotime() + linger_sec
+
+        for direction in ("c2s", "s2c"):
+            q = st["buf"].get(direction)
+            if not q:
+                st["active"][direction] = False
+                continue
+
+            while not self.outputs.has_active_targets(flow, direction) and monotime() < deadline:
+                await asyncio.sleep(0.02)
+
+            if self.outputs.has_active_targets(flow, direction):
+                await self._flush_startup_buffer(flow=flow, direction=direction, st=st)
+
+        # Anything still buffered at this point is truly undeliverable (no target).
+        try:
+            leftover = int(st.get("bytes", 0) or 0)
+        except Exception:
+            leftover = 0
+        if leftover > 0:
+            self._discard_startup_buffers(flow=flow, reason="startup_buffer_discard_on_close")
+        else:
+            self._startup_buffers.pop(sid, None)
     def list_sessions(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for sid, meta in self._sessions.items():
@@ -2112,8 +2261,8 @@ class Service:
                 "last_ts": meta["last_ts"],
                 "bytes_forwarded": self._session_bytes_out.get(sid, 0),
                 "bytes_dropped": self._session_bytes_drop.get(sid, 0),
-                "chunks_forwarded": int(self._session_chunks_out[sid]),
-                "chunks_dropped": int(self._session_chunks_drop[sid]),
+                "chunks_forwarded": self._session_chunks_out.get(sid, 0),
+                "chunks_dropped": self._session_chunks_drop.get(sid, 0),
             })
         return out
 
@@ -2136,8 +2285,8 @@ class Service:
             "last_ts": meta["last_ts"],
             "bytes_forwarded": self._session_bytes_out.get(session_id, 0),
             "bytes_dropped": self._session_bytes_drop.get(session_id, 0),
-            "chunks_forwarded": int(self._session_chunks_out.get(session_id, 0)),
-            "chunks_dropped": int(self._session_chunks_drop.get(session_id, 0)),
+            "chunks_forwarded": self._session_chunks_out.get(session_id, 0),
+            "chunks_dropped": self._session_chunks_drop.get(session_id, 0),
             "drops": drops,
         }
 
@@ -2164,7 +2313,8 @@ class Service:
 
         self._tasks.append(asyncio.create_task(self._consume_events(), name="svc.consume_events"))
         self._tasks.append(asyncio.create_task(self._consume_forward(), name="svc.consume_forward"))
-        self._tasks.append(asyncio.create_task(self._periodic_stats_local(), name="svc.stats_local"))
+        if self.stats_interval_sec > 0:
+            self._tasks.append(asyncio.create_task(self._periodic_stats_local(), name="svc.stats_local"))
 
         self.worker_inqs = [queue.Queue(maxsize=self.capture_queue_size) for _ in range(self.workers)]
         for wid in range(self.workers):
@@ -2251,6 +2401,8 @@ class Service:
 
             if ev.kind == "open":
                 self._sessions[sid] = {"flow": ev.flow.to_dict(), "open_ts": utc_iso(), "last_ts": utc_iso()}
+                if self.startup_buffer_bytes > 0:
+                    self._ensure_startup_buffer_state(sid)
                 await self.outputs.ensure_session(ev.flow)
                 await self.router.emit(cat="session", event="tcp_open", level="info", payload={"flow": ev.flow.to_dict()}, cp=True)
 
@@ -2258,6 +2410,10 @@ class Service:
                 meta = self._sessions.get(sid)
                 if meta:
                     meta["last_ts"] = utc_iso()
+
+                # On close, attempt to flush any startup-buffered bytes before closing outputs.
+                if self.startup_buffer_bytes > 0:
+                    await self._flush_startup_buffers_on_close(flow=ev.flow, reason=str(ev.data.get("reason", "close") if isinstance(ev.data, dict) else "close"))
 
                 summary = self.get_session(sid) or {"session_id": sid, "flow": ev.flow.to_dict()}
                 summary["reason"] = ev.data.get("reason")
@@ -2276,6 +2432,9 @@ class Service:
                 self._sessions.pop(sid, None)
                 self._session_bytes_out.pop(sid, None)
                 self._session_bytes_drop.pop(sid, None)
+                self._session_chunks_out.pop(sid, None)
+                self._session_chunks_drop.pop(sid, None)
+                self._startup_buffers.pop(sid, None)
                 for key in list(self._drop_count.keys()):
                     if key[0] == sid:
                         self._drop_count.pop(key, None)
@@ -2297,22 +2456,35 @@ class Service:
             sid = ch.flow.session_id
             stream = self.outputs.map_stream(ch.direction)
 
-            sent, dropped, reason, _targets, chunks_sent, chunks_dropped, _chunks_buffered = await self.outputs.write_chunk(ch.flow, ch.direction, ch.data)
+            # Startup buffering (covers the gap between seeing first bytes and having output targets connected)
+            if self.startup_buffer_bytes > 0:
+                st = self._ensure_startup_buffer_state(sid)
 
-            if sent:
-                self._bytes_forwarded += sent
-                self._chunks_forwarded += chunks_sent
-                self._session_bytes_out[sid] += sent
-                self._session_chunks_out[sid] += chunks_sent
+                if st["active"].get(ch.direction, False):
+                    ready = self.outputs.has_active_targets(ch.flow, ch.direction)
+                    if ready:
+                        await self._flush_startup_buffer(flow=ch.flow, direction=ch.direction, st=st)
+                    else:
+                        # Buffer up to per-session cap; drop overflow bytes only
+                        remaining = int(st["limit"]) - int(st["bytes"])
+                        if remaining <= 0:
+                            self._account_local_drop(sid=sid, stream=stream, dropped=len(ch.data),
+                                                     reason="startup_buffer_full", chunks=1)
+                            continue
 
-            if dropped:
-                self._bytes_dropped += dropped
-                self._chunks_dropped += chunks_dropped
-                self._session_bytes_drop[sid] += dropped
-                self._session_chunks_drop[sid] += chunks_dropped
-                key = (sid, stream, reason)
-                self._drop_count[key] += max(1, chunks_dropped)
-                self._drop_bytes[key] += dropped
+                        if len(ch.data) <= remaining:
+                            st["buf"][ch.direction].append(ch.data)
+                            st["bytes"] += len(ch.data)
+                        else:
+                            st["buf"][ch.direction].append(ch.data[:remaining])
+                            st["bytes"] += remaining
+                            self._account_local_drop(sid=sid, stream=stream, dropped=(len(ch.data) - remaining),
+                                                     reason="startup_buffer_full", chunks=1)
+                        continue
+
+            sent, dropped, reason, _targets = await self.outputs.write_chunk(ch.flow, ch.direction, ch.data)
+            self._account_forward_result(sid=sid, stream=stream, sent=sent, dropped=dropped, reason=reason)
+
 
 
 # =============================================================================

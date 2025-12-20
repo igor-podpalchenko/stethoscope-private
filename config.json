@@ -57,6 +57,9 @@
     },
     "logging": {
 	"verbosity_levels_available": "DEBUG, INFO, WARNING, ERROR",
+	"stats": {
+		"report_interval": 10
+	},
 	"file": {
 		"enabled": true,
 		"path": "tcpdumps/service.log",
