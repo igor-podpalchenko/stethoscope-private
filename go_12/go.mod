@@ -1,4 +1,4 @@
-module stethoscope/go_12
+module stethoscope
 
 go 1.22
 
