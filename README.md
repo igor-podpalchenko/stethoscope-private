@@ -149,18 +149,16 @@ If the network reorders them and receiver gets A, then C, then B:
 			That prevents the sender from needlessly retransmitting everything after the hole.
 			Without SACK, dup ACKs only tell the sender “I’m stuck at 2000” and the sender must guess more.
 
-"pcap": {
-  "enabled": true,
-  "dir": "tcpdumps/",
-  "format": "pcapng",
-  "per_session": true,
-  "queue_size": 20000,
-  "close_on_fin": true,
-  "fin_close_grace_sec": 0.5,
-  "idle_close_sec": 15
-}
 
 PCAP options available:
 io.output.pcap.linktype ("ethernet" | "raw" | "null" | "linux_sll" or an int DLT)
 
+
+Use following strategy, don't discard/drop bytes for newly opened tcp streams (as they just arrive). Introduce a memory buffer up to 64Kb per tcp session, with configurable size in io.input.capture. This way we will have the time from the moment new tcp socket is opened till we will open connection to listener and transmit buffered packets and than start realtime processing without buffer.
+
+
+For PCAP remove idle_close_sec functionality. I want full sessions with SYN for pcap.
+
+return aggregated stats counters (as it was before), add per session stats (bytes, drops, chunks).
+Both aggregated stats counters (by timer) and per session stats (bytes, drops, chunks) should be implemented.
 

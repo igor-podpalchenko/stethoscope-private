@@ -12,7 +12,7 @@
 		 }
   	    },
             "listner": {
-		"enabled": true,
+		"enabled": false,
       		"first_requests_port": 33010,
       		"first_responses_port": 33020,
 		"port_range_start": 33530,
@@ -31,8 +31,7 @@
         	"dir": "tcpdumps/",
         	"format": "pcapng",
         	"queue_size": 20000,
-                "fin_close_grace_sec": 0.5,
-		"idle_close_sec": 15
+                "fin_close_grace_sec": 0.5
       	    }
 	},
 	"input": {
@@ -46,6 +45,7 @@
 		"remote_port": 5000,
 		"_local_port": 56221,
   		"linktype": "ethernet",
+		"buffer_bytes": 65536,
 		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll"
     	    }
 	}
