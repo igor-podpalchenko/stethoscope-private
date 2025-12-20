@@ -22,6 +22,20 @@ type dropKey struct {
 	reason    string
 }
 
+type PcapStats struct {
+	Enabled      bool
+	Format       string
+	PerSession   bool
+	Dir          string
+	QueueSize    int
+	PktsWritten  int64
+	BytesWritten int64
+	PktsDropped  int64
+	PktsFailed   int64
+	FilesOpened  int64
+	FilesClosed  int64
+}
+
 type Service struct {
 	cfg Config
 	log *Logger
@@ -75,6 +89,8 @@ type Service struct {
 	bytesDropped    int64
 	chunksForwarded int64
 	chunksDropped   int64
+
+	pcap PcapStats
 
 	statsInterval time.Duration
 }
@@ -184,6 +200,16 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 	}
 	statsInterval := time.Duration(statsIntervalSec * float64(time.Second))
 
+	pcapCfg := GetMap(cfg, "io.output.pcap")
+	pcapEnabled := GetBool(pcapCfg, "enabled", false)
+	pcapFormat := stringsLowerTrim(GetString(pcapCfg, "format", "pcapng"))
+	if pcapFormat == "" {
+		pcapFormat = "pcapng"
+	}
+	pcapPerSession := GetBool(pcapCfg, "per_session", false)
+	pcapDir := GetString(pcapCfg, "dir", "")
+	pcapQueue := ToInt(pcapCfg["queue_size"], 0)
+
 	s := &Service{
 		cfg:                cfg,
 		log:                log,
@@ -211,7 +237,20 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 		sessionChunksDrop:  map[int]int64{},
 		dropCount:          map[dropKey]int64{},
 		dropBytes:          map[dropKey]int64{},
-		statsInterval:      statsInterval,
+		pcap: PcapStats{
+			Enabled:      pcapEnabled,
+			Format:       pcapFormat,
+			PerSession:   pcapPerSession,
+			Dir:          pcapDir,
+			QueueSize:    pcapQueue,
+			PktsWritten:  0,
+			BytesWritten: 0,
+			PktsDropped:  0,
+			PktsFailed:   0,
+			FilesOpened:  0,
+			FilesClosed:  0,
+		},
+		statsInterval: statsInterval,
 	}
 
 	s.control = NewControlPlane(controlBindIP, controlPort, log, defaultCats)
@@ -230,6 +269,18 @@ func (s *Service) StatsSnapshot() map[string]any {
 		"bytes_dropped":    s.bytesDropped,
 		"chunks_forwarded": s.chunksForwarded,
 		"chunks_dropped":   s.chunksDropped,
+		"pcap": map[string]any{
+			"enabled":       s.pcap.Enabled,
+			"format":        s.pcap.Format,
+			"per_session":   s.pcap.PerSession,
+			"dir":           s.pcap.Dir,
+			"pkts_written":  s.pcap.PktsWritten,
+			"bytes_written": s.pcap.BytesWritten,
+			"pkts_dropped":  s.pcap.PktsDropped,
+			"pkts_failed":   s.pcap.PktsFailed,
+			"files_opened":  s.pcap.FilesOpened,
+			"files_closed":  s.pcap.FilesClosed,
+		},
 	}
 	s.metaMu.Unlock()
 
@@ -582,6 +633,9 @@ func (s *Service) Start(parent context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(parent)
 
 	s.outputs = NewOutputManager(s.cfg, s.router, s.ctx)
+	if s.pcap.Enabled {
+		s.log.Infof("pcap output enabled format=%s per_session=%v dir=%s queue=%d", s.pcap.Format, s.pcap.PerSession, s.pcap.Dir, s.pcap.QueueSize)
+	}
 	s.control.SetCallbacks(s.StatsSnapshot, s.ListSessions, s.GetSession, s.CloseSessionByID)
 	if err := s.control.Start(s.ctx); err != nil {
 		return err
