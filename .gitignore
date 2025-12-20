@@ -20,6 +20,9 @@ venv/
 .vscode/
 .idea/
 
+# Go binaries
+go/stethoscope
+
 # Local capture dirs
 tcpdumps/
 out_http/
