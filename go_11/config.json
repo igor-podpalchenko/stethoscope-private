@@ -44,9 +44,13 @@
 		"remote_ip": "192.168.5.110",
 		"remote_port": 5000,
 		"_local_port": 56221,
+		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll",
   		"linktype": "ethernet",
-		"buffer_bytes": 524288,
-		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll"
+		"_buffer_bytes": 1048576,
+                "_c2s_buffer_bytes": 4194304,
+                "_s2c_buffer_bytes": 4194304,
+                "c2s_buffer_bytes": 2097152,
+                "s2c_buffer_bytes": 2097152
     	    }
 	}
     },
