@@ -1,6 +1,7 @@
 #!/bin/sh
 
-cd go/
+set -euo pipefail
+
+cd go_12/
 go mod tidy
-go get stethoscope
 go build -o stethoscope
