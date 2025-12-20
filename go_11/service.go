@@ -45,6 +45,10 @@ type Service struct {
 	forwardQ chan ForwardChunk
 	eventQ   chan SessionEvent
 
+	startupBufferBytes int
+	startupBuffers     map[int]*StartupBuffer
+	startupMu          sync.Mutex
+
 	workerInqs []chan PacketInfo
 	workersW   []*ReassemblyWorker
 	capture    *Capture
@@ -66,6 +70,13 @@ type Service struct {
 	chunksDropped   int64
 
 	statsInterval time.Duration
+}
+
+type StartupBuffer struct {
+	limit  int
+	bytes  int
+	buf    map[string][][]byte
+	active map[string]bool
 }
 
 func formatBPF(tpl string, vals map[string]string) string {
@@ -128,6 +139,7 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 	if ackStallAny != nil {
 		ackStall = time.Duration(ToFloat64(ackStallAny, 0) * float64(time.Second))
 	}
+	startupBuf := ClampInt(capCfg["buffer_bytes"], 65536, 0, 65536)
 
 	ctrl := GetMap(cfg, "control")
 	controlBindIP := strings.TrimSpace(fmt.Sprintf("%v", ctrl["bind_ip"]))
@@ -162,29 +174,31 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 	statsInterval := time.Duration(statsIntervalSec * float64(time.Second))
 
 	s := &Service{
-		cfg:              cfg,
-		log:              log,
-		iface:            iface,
-		localIP:          localIP,
-		remoteIP:         remoteIP,
-		remotePort:       remotePort,
-		localPortFilter:  localPortFilter,
-		bpf:              bpf,
-		workers:          workers,
-		captureQueueSize: captureQ,
-		sessionIdle:      time.Duration(sessionIdleSec * float64(time.Second)),
-		ackStall:         ackStall,
-		controlBindIP:    controlBindIP,
-		controlPort:      controlPort,
-		defaultCats:      defaultCats,
-		forwardQ:         make(chan ForwardChunk, 20000),
-		eventQ:           make(chan SessionEvent, 20000),
-		sessions:         map[int]map[string]any{},
-		sessionBytesOut:  map[int]int64{},
-		sessionBytesDrop: map[int]int64{},
-		dropCount:        map[dropKey]int64{},
-		dropBytes:        map[dropKey]int64{},
-		statsInterval:    statsInterval,
+		cfg:                cfg,
+		log:                log,
+		iface:              iface,
+		localIP:            localIP,
+		remoteIP:           remoteIP,
+		remotePort:         remotePort,
+		localPortFilter:    localPortFilter,
+		bpf:                bpf,
+		workers:            workers,
+		captureQueueSize:   captureQ,
+		sessionIdle:        time.Duration(sessionIdleSec * float64(time.Second)),
+		ackStall:           ackStall,
+		startupBufferBytes: startupBuf,
+		startupBuffers:     map[int]*StartupBuffer{},
+		controlBindIP:      controlBindIP,
+		controlPort:        controlPort,
+		defaultCats:        defaultCats,
+		forwardQ:           make(chan ForwardChunk, 20000),
+		eventQ:             make(chan SessionEvent, 20000),
+		sessions:           map[int]map[string]any{},
+		sessionBytesOut:    map[int]int64{},
+		sessionBytesDrop:   map[int]int64{},
+		dropCount:          map[dropKey]int64{},
+		dropBytes:          map[dropKey]int64{},
+		statsInterval:      statsInterval,
 	}
 
 	s.control = NewControlPlane(controlBindIP, controlPort, log, defaultCats)
@@ -195,18 +209,21 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 
 func (s *Service) StatsSnapshot() map[string]any {
 	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
-	return map[string]any{
-		"ts":                     utcISONow(),
-		"workers":                s.workers,
-		"sessions":               len(s.sessions),
-		"bytes_forwarded":        s.bytesForwarded,
-		"bytes_dropped":          s.bytesDropped,
-		"chunks_forwarded":       s.chunksForwarded,
-		"chunks_dropped":         s.chunksDropped,
-		"control_bytes_out":      s.control.BytesOut(),
-		"control_events_dropped": s.control.EventsDropped(),
+	snapshot := map[string]any{
+		"ts":               utcISONow(),
+		"workers":          s.workers,
+		"sessions":         len(s.sessions),
+		"bytes_forwarded":  s.bytesForwarded,
+		"bytes_dropped":    s.bytesDropped,
+		"chunks_forwarded": s.chunksForwarded,
+		"chunks_dropped":   s.chunksDropped,
 	}
+	s.metaMu.Unlock()
+
+	snapshot["drop_detail"] = s.DropDetailSnapshot(0)
+	snapshot["control_bytes_out"] = s.control.BytesOut()
+	snapshot["control_events_dropped"] = s.control.EventsDropped()
+	return snapshot
 }
 
 func (s *Service) DropDetailSnapshot(topN int) map[string]any {
@@ -315,6 +332,187 @@ func (s *Service) ListSessions() []map[string]any {
 		})
 	}
 	return out
+}
+
+func (s *Service) ensureStartupBufferState(sid int) *StartupBuffer {
+	s.startupMu.Lock()
+	defer s.startupMu.Unlock()
+
+	if sb, ok := s.startupBuffers[sid]; ok {
+		return sb
+	}
+
+	sb := &StartupBuffer{
+		limit:  s.startupBufferBytes,
+		bytes:  0,
+		buf:    map[string][][]byte{"c2s": [][]byte{}, "s2c": [][]byte{}},
+		active: map[string]bool{"c2s": true, "s2c": true},
+	}
+	s.startupBuffers[sid] = sb
+	return sb
+}
+
+func (s *Service) flushStartupBuffer(flow FlowKey, direction string, sb *StartupBuffer) {
+	sid := flow.SessionID()
+	stream := s.outputs.MapStream(direction)
+
+	for {
+		s.startupMu.Lock()
+		q := sb.buf[direction]
+		if len(q) == 0 {
+			sb.active[direction] = false
+			s.startupMu.Unlock()
+			return
+		}
+		data := q[0]
+		sb.buf[direction] = q[1:]
+		sb.bytes -= len(data)
+		s.startupMu.Unlock()
+
+		sent, dropped, reason, _ := s.outputs.WriteChunk(flow, direction, data)
+		s.accountForwardResult(sid, stream, sent, dropped, reason)
+	}
+}
+
+func (s *Service) discardStartupBuffers(flow FlowKey, reason string) {
+	sid := flow.SessionID()
+
+	s.startupMu.Lock()
+	sb, ok := s.startupBuffers[sid]
+	if !ok {
+		s.startupMu.Unlock()
+		return
+	}
+
+	bufCopy := map[string][][]byte{
+		"c2s": append([][]byte{}, sb.buf["c2s"]...),
+		"s2c": append([][]byte{}, sb.buf["s2c"]...),
+	}
+	delete(s.startupBuffers, sid)
+	s.startupMu.Unlock()
+
+	for _, direction := range []string{"c2s", "s2c"} {
+		stream := s.outputs.MapStream(direction)
+		var droppedBytes int
+		chunks := len(bufCopy[direction])
+		for _, data := range bufCopy[direction] {
+			droppedBytes += len(data)
+		}
+		if droppedBytes > 0 {
+			s.accountLocalDrop(sid, stream, droppedBytes, reason, chunks)
+		}
+	}
+}
+
+func (s *Service) flushStartupBuffersOnClose(flow FlowKey, reason string) {
+	if s.startupBufferBytes <= 0 {
+		return
+	}
+	sid := flow.SessionID()
+
+	closeGraceMS := ClampInt(GetPath(s.cfg, "runtime.close_grace_ms", 100), 100, 0, 10_000)
+	if closeGraceMS > 0 {
+		time.Sleep(time.Duration(closeGraceMS) * time.Millisecond)
+	}
+
+	s.startupMu.Lock()
+	sb, ok := s.startupBuffers[sid]
+	if !ok {
+		s.startupMu.Unlock()
+		return
+	}
+	buffered := sb.bytes
+	s.startupMu.Unlock()
+
+	if buffered <= 0 {
+		s.startupMu.Lock()
+		delete(s.startupBuffers, sid)
+		s.startupMu.Unlock()
+		return
+	}
+
+	lingerSec := ToFloat64(GetPath(s.cfg, "runtime.close_linger_sec", 2.0), 2.0)
+	if lingerSec < 0 {
+		lingerSec = 0
+	}
+	deadline := time.Now().Add(time.Duration(lingerSec * float64(time.Second)))
+
+	for _, direction := range []string{"c2s", "s2c"} {
+		for {
+			s.startupMu.Lock()
+			empty := len(sb.buf[direction]) == 0
+			s.startupMu.Unlock()
+			if empty {
+				s.startupMu.Lock()
+				sb.active[direction] = false
+				s.startupMu.Unlock()
+				break
+			}
+
+			if s.outputs.HasActiveTargets(flow, direction) {
+				s.flushStartupBuffer(flow, direction, sb)
+				break
+			}
+
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	s.startupMu.Lock()
+	leftover := sb.bytes
+	s.startupMu.Unlock()
+
+	if leftover > 0 {
+		s.discardStartupBuffers(flow, "startup_buffer_discard_on_close")
+	} else {
+		s.startupMu.Lock()
+		delete(s.startupBuffers, sid)
+		s.startupMu.Unlock()
+	}
+}
+
+func (s *Service) accountForwardResult(sid int, stream string, sent int, dropped int, reason string) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+
+	if sent > 0 {
+		s.bytesForwarded += int64(sent)
+		s.chunksForwarded += 1
+		s.sessionBytesOut[sid] += int64(sent)
+	}
+
+	if dropped > 0 {
+		s.bytesDropped += int64(dropped)
+		s.chunksDropped += 1
+		s.sessionBytesDrop[sid] += int64(dropped)
+		k := dropKey{sessionID: sid, stream: stream, reason: reason}
+		s.dropCount[k] += 1
+		s.dropBytes[k] += int64(dropped)
+	}
+}
+
+func (s *Service) accountLocalDrop(sid int, stream string, dropped int, reason string, chunks int) {
+	if dropped <= 0 {
+		return
+	}
+
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+
+	s.bytesDropped += int64(dropped)
+	s.sessionBytesDrop[sid] += int64(dropped)
+
+	if chunks > 0 {
+		s.chunksDropped += int64(chunks)
+		k := dropKey{sessionID: sid, stream: stream, reason: reason}
+		s.dropCount[k] += int64(chunks)
+	}
+
+	k := dropKey{sessionID: sid, stream: stream, reason: reason}
+	s.dropBytes[k] += int64(dropped)
 }
 
 func (s *Service) GetSession(sessionID int) map[string]any {
@@ -486,6 +684,10 @@ func (s *Service) handleEvent(ev SessionEvent) {
 		s.sessions[sid] = map[string]any{"flow": ev.Flow.ToDict(), "open_ts": utcISONow(), "last_ts": utcISONow()}
 		s.metaMu.Unlock()
 
+		if s.startupBufferBytes > 0 {
+			s.ensureStartupBufferState(sid)
+		}
+
 		s.outputs.EnsureSession(ev.Flow)
 		s.router.Emit("session", "tcp_open", "info", map[string]any{"flow": ev.Flow.ToDict()}, true)
 		return
@@ -505,6 +707,10 @@ func (s *Service) handleEvent(ev SessionEvent) {
 		}
 		summary["reason"] = ev.Data["reason"]
 
+		if s.startupBufferBytes > 0 {
+			s.flushStartupBuffersOnClose(ev.Flow, fmt.Sprintf("%v", ev.Data["reason"]))
+		}
+
 		s.router.Emit("session", "session_summary", "info", summary, true)
 		s.outputs.CloseSession(ev.Flow, fmt.Sprintf("%v", ev.Data["reason"]))
 		s.router.Emit("session", "tcp_close", "info", map[string]any{"flow": ev.Flow.ToDict(), "reason": ev.Data["reason"]}, true)
@@ -520,6 +726,10 @@ func (s *Service) handleEvent(ev SessionEvent) {
 			}
 		}
 		s.metaMu.Unlock()
+
+		s.startupMu.Lock()
+		delete(s.startupBuffers, sid)
+		s.startupMu.Unlock()
 		return
 	}
 
@@ -538,6 +748,44 @@ func (s *Service) consumeForward() {
 		case <-s.ctx.Done():
 			return
 		case ch := <-s.forwardQ:
+			sid := ch.Flow.SessionID()
+			stream := s.outputs.MapStream(ch.Direction)
+
+			if s.startupBufferBytes > 0 {
+				sb := s.ensureStartupBufferState(sid)
+				s.startupMu.Lock()
+				active := sb.active[ch.Direction]
+				s.startupMu.Unlock()
+
+				if active {
+					if s.outputs.HasActiveTargets(ch.Flow, ch.Direction) {
+						s.flushStartupBuffer(ch.Flow, ch.Direction, sb)
+					} else {
+						s.startupMu.Lock()
+						remaining := sb.limit - sb.bytes
+						s.startupMu.Unlock()
+						if remaining <= 0 {
+							s.accountLocalDrop(sid, stream, len(ch.Data), "startup_buffer_full", 1)
+							continue
+						}
+
+						if len(ch.Data) <= remaining {
+							s.startupMu.Lock()
+							sb.buf[ch.Direction] = append(sb.buf[ch.Direction], ch.Data)
+							sb.bytes += len(ch.Data)
+							s.startupMu.Unlock()
+						} else {
+							s.startupMu.Lock()
+							sb.buf[ch.Direction] = append(sb.buf[ch.Direction], ch.Data[:remaining])
+							sb.bytes += remaining
+							s.startupMu.Unlock()
+							s.accountLocalDrop(sid, stream, len(ch.Data)-remaining, "startup_buffer_full", 1)
+						}
+						continue
+					}
+				}
+			}
+
 			s.handleChunk(ch)
 		}
 	}
@@ -548,23 +796,7 @@ func (s *Service) handleChunk(ch ForwardChunk) {
 	stream := s.outputs.MapStream(ch.Direction)
 
 	sent, dropped, reason, _ := s.outputs.WriteChunk(ch.Flow, ch.Direction, ch.Data)
-
-	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
-
-	if sent > 0 {
-		s.bytesForwarded += int64(sent)
-		s.chunksForwarded += 1
-		s.sessionBytesOut[sid] += int64(sent)
-	}
-	if dropped > 0 {
-		s.bytesDropped += int64(dropped)
-		s.chunksDropped += 1
-		s.sessionBytesDrop[sid] += int64(dropped)
-		k := dropKey{sessionID: sid, stream: stream, reason: reason}
-		s.dropCount[k] += 1
-		s.dropBytes[k] += int64(dropped)
-	}
+	s.accountForwardResult(sid, stream, sent, dropped, reason)
 }
 
 // Convenience: get current process pid for debug.

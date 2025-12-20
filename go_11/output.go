@@ -352,6 +352,22 @@ func (om *OutputManager) EnsureSession(flow FlowKey) *SessionOutputs {
 	return so
 }
 
+func (om *OutputManager) HasActiveTargets(flow FlowKey, direction string) bool {
+	om.mu.Lock()
+	so := om.sessions[flow]
+	om.mu.Unlock()
+	if so == nil {
+		return false
+	}
+	stream := om.MapStream(direction)
+	for _, tw := range so.AllTargetsFor(stream) {
+		if tw != nil && !tw.IsClosing() {
+			return true
+		}
+	}
+	return false
+}
+
 func (om *OutputManager) FindFlowBySessionID(sessionID int) (FlowKey, bool) {
 	om.mu.Lock()
 	defer om.mu.Unlock()
