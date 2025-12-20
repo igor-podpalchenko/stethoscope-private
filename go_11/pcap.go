@@ -230,10 +230,25 @@ func (p *PcapSink) Enqueue(flow FlowKey, pkt gopacket.Packet) {
 	ci := pkt.Metadata().CaptureInfo
 	lt := layers.LinkTypeEthernet
 	if ll := pkt.LinkLayer(); ll != nil {
-		lt = ll.LayerType()
+		lt = linkTypeFromLayer(ll)
 	}
 
 	p.enqueue(pcapItem{flow: flow, data: data, ci: ci, linkType: lt})
+}
+
+func linkTypeFromLayer(ll gopacket.Layer) layers.LinkType {
+	switch ll.LayerType() {
+	case layers.LayerTypeEthernet:
+		return layers.LinkTypeEthernet
+	case layers.LayerTypeLoopback:
+		return layers.LinkTypeLoop
+	case layers.LayerTypeLinuxSLL:
+		return layers.LinkTypeLinuxSLL
+	case layers.LayerTypePPP:
+		return layers.LinkTypePPP
+	default:
+		return layers.LinkTypeEthernet
+	}
 }
 
 func (p *PcapSink) CloseFlow(flow FlowKey, reason string) {
