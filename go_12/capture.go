@@ -40,7 +40,8 @@ func (c *Capture) Start() error {
 	pool := tcpassembly.NewStreamPool(factory)
 	c.pool = pool
 	c.assembler = tcpassembly.NewAssembler(pool)
-	c.assembler.MaxBufferedPagesTotal(0)
+	c.assembler.MaxBufferedPagesTotal = 0
+
 
 	handle, err := pcap.OpenLive(c.cfg.Iface, 65535, true, pcap.BlockForever)
 	if err != nil {
@@ -48,7 +49,7 @@ func (c *Capture) Start() error {
 	}
 	if c.bpf != "" {
 		if err := handle.SetBPFFilter(c.bpf); err != nil {
-			_ = handle.Close()
+			handle.Close()
 			return fmt.Errorf("bpf filter: %w", err)
 		}
 	}
