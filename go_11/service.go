@@ -57,12 +57,14 @@ type Service struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	metaMu           sync.Mutex
-	sessions         map[int]map[string]any
-	sessionBytesOut  map[int]int64
-	sessionBytesDrop map[int]int64
-	dropCount        map[dropKey]int64
-	dropBytes        map[dropKey]int64
+	metaMu            sync.Mutex
+	sessions          map[int]map[string]any
+	sessionBytesOut   map[int]int64
+	sessionBytesDrop  map[int]int64
+	sessionChunksOut  map[int]int64
+	sessionChunksDrop map[int]int64
+	dropCount         map[dropKey]int64
+	dropBytes         map[dropKey]int64
 
 	bytesForwarded  int64
 	bytesDropped    int64
@@ -196,6 +198,8 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 		sessions:           map[int]map[string]any{},
 		sessionBytesOut:    map[int]int64{},
 		sessionBytesDrop:   map[int]int64{},
+		sessionChunksOut:   map[int]int64{},
+		sessionChunksDrop:  map[int]int64{},
 		dropCount:          map[dropKey]int64{},
 		dropBytes:          map[dropKey]int64{},
 		statsInterval:      statsInterval,
@@ -323,12 +327,14 @@ func (s *Service) ListSessions() []map[string]any {
 	out := []map[string]any{}
 	for sid, meta := range s.sessions {
 		out = append(out, map[string]any{
-			"session_id":      sid,
-			"flow":            meta["flow"],
-			"open_ts":         meta["open_ts"],
-			"last_ts":         meta["last_ts"],
-			"bytes_forwarded": s.sessionBytesOut[sid],
-			"bytes_dropped":   s.sessionBytesDrop[sid],
+			"session_id":       sid,
+			"flow":             meta["flow"],
+			"open_ts":          meta["open_ts"],
+			"last_ts":          meta["last_ts"],
+			"bytes_forwarded":  s.sessionBytesOut[sid],
+			"bytes_dropped":    s.sessionBytesDrop[sid],
+			"chunks_forwarded": s.sessionChunksOut[sid],
+			"chunks_dropped":   s.sessionChunksDrop[sid],
 		})
 	}
 	return out
@@ -482,12 +488,14 @@ func (s *Service) accountForwardResult(sid int, stream string, sent int, dropped
 		s.bytesForwarded += int64(sent)
 		s.chunksForwarded += 1
 		s.sessionBytesOut[sid] += int64(sent)
+		s.sessionChunksOut[sid] += 1
 	}
 
 	if dropped > 0 {
 		s.bytesDropped += int64(dropped)
 		s.chunksDropped += 1
 		s.sessionBytesDrop[sid] += int64(dropped)
+		s.sessionChunksDrop[sid] += 1
 		k := dropKey{sessionID: sid, stream: stream, reason: reason}
 		s.dropCount[k] += 1
 		s.dropBytes[k] += int64(dropped)
@@ -507,6 +515,7 @@ func (s *Service) accountLocalDrop(sid int, stream string, dropped int, reason s
 
 	if chunks > 0 {
 		s.chunksDropped += int64(chunks)
+		s.sessionChunksDrop[sid] += int64(chunks)
 		k := dropKey{sessionID: sid, stream: stream, reason: reason}
 		s.dropCount[k] += int64(chunks)
 	}
@@ -536,13 +545,15 @@ func (s *Service) GetSession(sessionID int) map[string]any {
 		}
 	}
 	return map[string]any{
-		"session_id":      sessionID,
-		"flow":            meta["flow"],
-		"open_ts":         meta["open_ts"],
-		"last_ts":         meta["last_ts"],
-		"bytes_forwarded": s.sessionBytesOut[sessionID],
-		"bytes_dropped":   s.sessionBytesDrop[sessionID],
-		"drops":           drops,
+		"session_id":       sessionID,
+		"flow":             meta["flow"],
+		"open_ts":          meta["open_ts"],
+		"last_ts":          meta["last_ts"],
+		"bytes_forwarded":  s.sessionBytesOut[sessionID],
+		"bytes_dropped":    s.sessionBytesDrop[sessionID],
+		"chunks_forwarded": s.sessionChunksOut[sessionID],
+		"chunks_dropped":   s.sessionChunksDrop[sessionID],
+		"drops":            drops,
 	}
 }
 
@@ -719,6 +730,8 @@ func (s *Service) handleEvent(ev SessionEvent) {
 		delete(s.sessions, sid)
 		delete(s.sessionBytesOut, sid)
 		delete(s.sessionBytesDrop, sid)
+		delete(s.sessionChunksOut, sid)
+		delete(s.sessionChunksDrop, sid)
 		for k := range s.dropCount {
 			if k.sessionID == sid {
 				delete(s.dropCount, k)
