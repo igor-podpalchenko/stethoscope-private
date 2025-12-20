@@ -45,7 +45,7 @@
 		"remote_port": 5000,
 		"_local_port": 56221,
   		"linktype": "ethernet",
-		"buffer_bytes": 65536,
+		"buffer_bytes": 524288,
 		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll"
     	    }
 	}

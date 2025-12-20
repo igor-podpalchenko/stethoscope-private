@@ -2,6 +2,6 @@
 
 set -euo pipefail
 
-cd go_12/
+cd go_11/
 go mod tidy
 go build -o stethoscope
