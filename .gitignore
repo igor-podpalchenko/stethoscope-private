@@ -1,0 +1,25 @@
+# Keep empty dirs
+!tcpdumps/.gitkeep
+!out_http/.gitkeep
+
+# MacOS
+.DS_Store/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtualenvs
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Local capture dirs
+tcpdumps/
+out_http/

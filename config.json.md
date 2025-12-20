@@ -1,6 +1,5 @@
 # stethoscope config.json.doc
 
-This file is **documentation only** (human reference). The app must use a normal `config.json` without comments.
 
 ## High-level structure
 
