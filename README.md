@@ -149,4 +149,18 @@ If the network reorders them and receiver gets A, then C, then B:
 			That prevents the sender from needlessly retransmitting everything after the hole.
 			Without SACK, dup ACKs only tell the sender “I’m stuck at 2000” and the sender must guess more.
 
+"pcap": {
+  "enabled": true,
+  "dir": "tcpdumps/",
+  "format": "pcapng",
+  "per_session": true,
+  "queue_size": 20000,
+  "close_on_fin": true,
+  "fin_close_grace_sec": 0.5,
+  "idle_close_sec": 15
+}
+
+PCAP options available:
+io.output.pcap.linktype ("ethernet" | "raw" | "null" | "linux_sll" or an int DLT)
+
 
