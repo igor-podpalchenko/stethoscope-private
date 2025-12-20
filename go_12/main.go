@@ -11,7 +11,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "", "Path to config file")
-	logLevel := flag.String("log-level", "INFO", "Console log level: DEBUG/INFO/WARN/ERROR")
+	logLevel := flag.String("log-level", "", "Optional console override: DEBUG/INFO/WARN/ERROR")
 	flag.Parse()
 
 	if *cfgPath == "" {
@@ -25,7 +25,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	log := newLogger(*logLevel)
+	log, err := SetupLoggingFromConfig(cfg, *logLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logging error: %v\n", err)
+		os.Exit(1)
+	}
+	defer log.Close()
 
 	svc, err := NewService(cfg, log)
 	if err != nil {
