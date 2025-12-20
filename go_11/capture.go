@@ -21,6 +21,7 @@ type Capture struct {
 
 	workers []chan PacketInfo
 	log     *Logger
+	pcap    *PcapSink
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -29,7 +30,7 @@ type Capture struct {
 	pcapBufsize *int
 }
 
-func NewCapture(iface, bpf, localIP, remoteIP string, workers []chan PacketInfo, log *Logger, parent context.Context, pcapBufsize *int) *Capture {
+func NewCapture(iface, bpf, localIP, remoteIP string, workers []chan PacketInfo, log *Logger, parent context.Context, pcapBufsize *int, pcapSink *PcapSink) *Capture {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -41,6 +42,7 @@ func NewCapture(iface, bpf, localIP, remoteIP string, workers []chan PacketInfo,
 		remoteIP:    remoteIP,
 		workers:     workers,
 		log:         log,
+		pcap:        pcapSink,
 		ctx:         ctx,
 		cancel:      cancel,
 		pcapBufsize: pcapBufsize,
@@ -182,6 +184,10 @@ func (c *Capture) handlePacket(pkt gopacket.Packet) {
 	default:
 		// Drop if worker queue is full (prototype behavior).
 		return
+	}
+
+	if c.pcap != nil {
+		c.pcap.Enqueue(flow, pkt)
 	}
 }
 
