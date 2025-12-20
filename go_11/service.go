@@ -57,9 +57,10 @@ type Service struct {
 	controlPort   int
 	defaultCats   []string
 
-	control *ControlPlane
-	router  *EventRouter
-	outputs *OutputManager
+	control  *ControlPlane
+	router   *EventRouter
+	outputs  *OutputManager
+	pcapSink *PcapSink
 
 	forwardQ chan ForwardChunk
 	eventQ   chan SessionEvent
@@ -209,6 +210,11 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 	pcapPerSession := GetBool(pcapCfg, "per_session", false)
 	pcapDir := GetString(pcapCfg, "dir", "")
 	pcapQueue := ToInt(pcapCfg["queue_size"], 0)
+	if pcapQueue <= 0 {
+		pcapQueue = 20000
+	}
+	pcapSink := NewPcapSink(pcapEnabled, pcapDir, pcapFormat, pcapPerSession, pcapQueue, log)
+	pcapStats := pcapSink.Stats()
 
 	s := &Service{
 		cfg:                cfg,
@@ -237,20 +243,9 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 		sessionChunksDrop:  map[int]int64{},
 		dropCount:          map[dropKey]int64{},
 		dropBytes:          map[dropKey]int64{},
-		pcap: PcapStats{
-			Enabled:      pcapEnabled,
-			Format:       pcapFormat,
-			PerSession:   pcapPerSession,
-			Dir:          pcapDir,
-			QueueSize:    pcapQueue,
-			PktsWritten:  0,
-			BytesWritten: 0,
-			PktsDropped:  0,
-			PktsFailed:   0,
-			FilesOpened:  0,
-			FilesClosed:  0,
-		},
-		statsInterval: statsInterval,
+		pcap:               pcapStats,
+		pcapSink:           pcapSink,
+		statsInterval:      statsInterval,
 	}
 
 	s.control = NewControlPlane(controlBindIP, controlPort, log, defaultCats)
@@ -260,6 +255,11 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 }
 
 func (s *Service) StatsSnapshot() map[string]any {
+	pcapStats := s.pcap
+	if s.pcapSink != nil {
+		pcapStats = s.pcapSink.Stats()
+	}
+
 	s.metaMu.Lock()
 	snapshot := map[string]any{
 		"ts":               utcISONow(),
@@ -270,16 +270,16 @@ func (s *Service) StatsSnapshot() map[string]any {
 		"chunks_forwarded": s.chunksForwarded,
 		"chunks_dropped":   s.chunksDropped,
 		"pcap": map[string]any{
-			"enabled":       s.pcap.Enabled,
-			"format":        s.pcap.Format,
-			"per_session":   s.pcap.PerSession,
-			"dir":           s.pcap.Dir,
-			"pkts_written":  s.pcap.PktsWritten,
-			"bytes_written": s.pcap.BytesWritten,
-			"pkts_dropped":  s.pcap.PktsDropped,
-			"pkts_failed":   s.pcap.PktsFailed,
-			"files_opened":  s.pcap.FilesOpened,
-			"files_closed":  s.pcap.FilesClosed,
+			"enabled":       pcapStats.Enabled,
+			"format":        pcapStats.Format,
+			"per_session":   pcapStats.PerSession,
+			"dir":           pcapStats.Dir,
+			"pkts_written":  pcapStats.PktsWritten,
+			"bytes_written": pcapStats.BytesWritten,
+			"pkts_dropped":  pcapStats.PktsDropped,
+			"pkts_failed":   pcapStats.PktsFailed,
+			"files_opened":  pcapStats.FilesOpened,
+			"files_closed":  pcapStats.FilesClosed,
 		},
 	}
 	s.metaMu.Unlock()
@@ -633,6 +633,10 @@ func (s *Service) Start(parent context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(parent)
 
 	s.outputs = NewOutputManager(s.cfg, s.router, s.ctx)
+	if s.pcapSink != nil {
+		_ = s.pcapSink.Start(s.ctx)
+		s.pcap = s.pcapSink.Stats()
+	}
 	if s.pcap.Enabled {
 		s.log.Infof("pcap output enabled format=%s per_session=%v dir=%s queue=%d", s.pcap.Format, s.pcap.PerSession, s.pcap.Dir, s.pcap.QueueSize)
 	}
@@ -683,7 +687,7 @@ func (s *Service) Start(parent context.Context) error {
 			pcapBuf = &vv
 		}
 	}
-	s.capture = NewCapture(s.iface, s.bpf, s.localIP, s.remoteIP, s.workerInqs, s.log, s.ctx, pcapBuf)
+	s.capture = NewCapture(s.iface, s.bpf, s.localIP, s.remoteIP, s.workerInqs, s.log, s.ctx, pcapBuf, s.pcapSink)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -709,6 +713,9 @@ func (s *Service) Stop(ctx context.Context) error {
 		for _, fk := range s.outputs.ListFlows() {
 			s.outputs.CloseSession(fk, "service_stop")
 		}
+	}
+	if s.pcapSink != nil {
+		s.pcapSink.Stop()
 	}
 	if s.control != nil {
 		s.control.Close()
@@ -787,6 +794,9 @@ func (s *Service) handleEvent(ev SessionEvent) {
 
 		s.router.Emit("session", "session_summary", "info", summary, true)
 		s.outputs.CloseSession(ev.Flow, fmt.Sprintf("%v", ev.Data["reason"]))
+		if s.pcapSink != nil {
+			s.pcapSink.CloseFlow(ev.Flow, fmt.Sprintf("%v", ev.Data["reason"]))
+		}
 		s.router.Emit("session", "tcp_close", "info", map[string]any{"flow": ev.Flow.ToDict(), "reason": ev.Data["reason"]}, true)
 
 		s.metaMu.Lock()
