@@ -1,0 +1,73 @@
+{
+    "io": {
+  	"output": {
+	    "remote-host": {
+		"enabled": true,
+      		"host": "127.0.0.1",
+      		"requests_port": 33030,
+      		"responses_port": 33040,
+		"timeouts": { 
+		     "connect": 5,
+		     "retry-every": 30
+		 }
+  	    },
+            "listner": {
+		"enabled": false,
+      		"first_requests_port": 33010,
+      		"first_responses_port": 33020,
+		"port_range_start": 33530,
+		"port_range_end": 33600,
+      		"bind_ip": "0.0.0.0",
+		"_bind_interface": "en1",
+		"timeouts": { 
+		      "ack_stall_sec": 5
+		}
+            },
+	    "pcap": {
+        	"enabled": true,
+        	"per_session": true,
+                "close_on_fin": true,
+                "sync": false,
+        	"dir": "tcpdumps/",
+        	"format": "pcapng",
+        	"queue_size": 20000,
+                "fin_close_grace_sec": 0.5
+      	    }
+	},
+	"input": {
+	    "capture": {
+      		"bpf-filter": "tcp and ((src host {local_ip} and dst host {remote_ip} and dst port {remote_port}) or (src host {remote_ip} and src port {remote_port} and dst host {local_ip}))",
+		"iface": "en0",
+      		"_iface": "utun7",
+		"local_ip": "192.168.5.38",
+		"_local_ip": "100.79.85.9",
+		"remote_ip": "192.168.5.110",
+		"remote_port": 5000,
+		"_local_port": 56221,
+  		"linktype": "ethernet",
+		"buffer_bytes": 65536,
+		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll"
+    	    }
+	}
+    },
+    "control": { 
+      "bind_ip": "0.0.0.0",
+      "listen_port": 50005,
+      "default_cats": ["session","ports","output","control"]
+    },
+    "logging": {
+	"verbosity_levels_available": "DEBUG, INFO, WARNING, ERROR",
+	"stats": {
+		"report_interval": 10
+	},
+	"file": {
+		"enabled": true,
+		"path": "tcpdumps/service.log",
+		"verbosity": "DEBUG"
+        },
+        "console": {
+		"verbosity": "INFO"
+	}
+    }
+}
+
