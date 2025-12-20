@@ -40,9 +40,8 @@ func (c *Capture) Start() error {
 	pool := tcpassembly.NewStreamPool(factory)
 	c.pool = pool
 	c.assembler = tcpassembly.NewAssembler(pool)
-	// Disable global buffered page limit to mirror the Python implementation's
-	// unbounded reassembly behavior; the field is an integer, not a setter.
 	c.assembler.MaxBufferedPagesTotal = 0
+
 
 	handle, err := pcap.OpenLive(c.cfg.Iface, 65535, true, pcap.BlockForever)
 	if err != nil {
