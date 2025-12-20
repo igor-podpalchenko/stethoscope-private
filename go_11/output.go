@@ -647,15 +647,15 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 		so.mu.Unlock()
 		tw.Close()
 
-		// Requested: CP event only if it *was* connected before.
-		if st.CurrentlyConnected {
-			st.CurrentlyConnected = false
-			om.router.Emit("output", "connector_disconnected", "warning", map[string]any{
-				"flow":            so.Flow.ToDict(),
-				"stream":          stream,
-				"retry_every_sec": om.connRetryEvery.Seconds(),
-			}, true)
-		} else {
+                // Requested: CP event only if it *was* connected before.
+                if st.CurrentlyConnected {
+                        st.CurrentlyConnected = false
+                        om.router.Emit("output", "connector_disconnected", "info", map[string]any{
+                                "flow":            so.Flow.ToDict(),
+                                "stream":          stream,
+                                "retry_every_sec": om.connRetryEvery.Seconds(),
+                        }, true)
+                } else {
 			om.router.Emit("output", "connector_disconnect_suppressed", "debug", map[string]any{
 				"flow":   so.Flow.ToDict(),
 				"stream": stream,

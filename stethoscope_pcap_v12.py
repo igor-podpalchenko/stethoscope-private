@@ -1800,15 +1800,15 @@ class OutputManager:
                     pass
 
             # Requested: CP event only if it *was* connected before.
-            if st.currently_connected:
-                st.currently_connected = False
-                await self.router.emit(
-                    cat="output",
-                    event="connector_disconnected",
-                    level="warning",
-                    payload={"flow": so.flow.to_dict(), "stream": stream, "retry_every_sec": self.conn_retry_every},
-                    cp=True,
-                )
+                if st.currently_connected:
+                    st.currently_connected = False
+                    await self.router.emit(
+                        cat="output",
+                        event="connector_disconnected",
+                        level="info",
+                        payload={"flow": so.flow.to_dict(), "stream": stream, "retry_every_sec": self.conn_retry_every},
+                        cp=True,
+                    )
             else:
                 await self.router.emit(
                     cat="output",
