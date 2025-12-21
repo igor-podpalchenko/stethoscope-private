@@ -50,6 +50,19 @@ type PcapSink struct {
 	wg     sync.WaitGroup
 }
 
+const (
+	// maxSnapLen defines the capture snap length we write into pcap/pcapng
+	// headers. Zui/Zeek enforce that packet capture lengths do not exceed
+	// the snaplen recorded in the file, so we cap both the writer headers
+	// and the per-packet CaptureLength at this value to keep files
+	// readable by stricter consumers.
+	//
+	// Keep this aligned with the Python implementation (stethoscope_pcap_v13.py),
+	// which defaults to scapy's DEFAULT_SNAPLEN (currently 262_144) and is known
+	// to be accepted by Zui.
+	maxSnapLen = 262144
+)
+
 func NewPcapSink(enabled bool, dir, format string, perSession bool, queueSize int, log *Logger) *PcapSink {
 	fmtStr := strings.TrimSpace(strings.ToLower(format))
 	if fmtStr == "" {
@@ -147,7 +160,7 @@ func (p *PcapSink) openWriter(flow FlowKey, lt layers.LinkType, ci gopacket.Capt
 
 	var w pcapWriter
 	if p.stats.Format == "pcapng" {
-		ng, err := pcapgo.NewNgWriter(f, lt)
+		ng, err := pcapgo.NewNgWriterInterface(f, pcapgo.NgInterface{SnapLength: maxSnapLen, LinkType: lt}, pcapgo.NgWriterOptions{})
 		if err != nil {
 			f.Close()
 			return nil, err
@@ -155,7 +168,7 @@ func (p *PcapSink) openWriter(flow FlowKey, lt layers.LinkType, ci gopacket.Capt
 		w = ng
 	} else {
 		pw := pcapgo.NewWriter(f)
-		if err := pw.WriteFileHeader(uint32(65535), lt); err != nil {
+		if err := pw.WriteFileHeader(uint32(maxSnapLen), lt); err != nil {
 			f.Close()
 			return nil, err
 		}
@@ -196,6 +209,10 @@ func (p *PcapSink) writeOne(meta *pcapWriterMeta, item pcapItem) bool {
 	if meta == nil || meta.writer == nil {
 		return false
 	}
+	data := item.data
+	if len(data) > maxSnapLen {
+		data = data[:maxSnapLen]
+	}
 	ci := item.ci
 	if ci.Timestamp.IsZero() {
 		ci.Timestamp = time.Now()
@@ -204,11 +221,11 @@ func (p *PcapSink) writeOne(meta *pcapWriterMeta, item pcapItem) bool {
 	// (or gopacket decoders) may leave CaptureLength/Length at zero, which causes
 	// pcapgo writers to reject the write and return an error. Since we are writing
 	// the exact captured bytes, force both lengths to match the payload size.
-	ci.CaptureLength = len(item.data)
-	ci.Length = len(item.data)
+	ci.CaptureLength = len(data)
+	ci.Length = len(data)
 	ci.InterfaceIndex = 0
 
-	if err := meta.writer.WritePacket(ci, item.data); err != nil {
+	if err := meta.writer.WritePacket(ci, data); err != nil {
 		p.statsMu.Lock()
 		p.stats.PktsFailed++
 		p.statsMu.Unlock()
@@ -221,7 +238,7 @@ func (p *PcapSink) writeOne(meta *pcapWriterMeta, item pcapItem) bool {
 	}
 	p.statsMu.Lock()
 	p.stats.PktsWritten++
-	p.stats.BytesWritten += int64(len(item.data))
+	p.stats.BytesWritten += int64(len(data))
 	p.statsMu.Unlock()
 	return true
 }
