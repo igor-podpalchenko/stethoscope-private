@@ -35,7 +35,11 @@ The app accepts JSON or “json-ish” (comments and unquoted keys) configs. Key
 - **Runtime (`runtime`)** – Worker count (default CPU cores, clamped to 1–256), capture queue size, per-output `max_output_buffer_bytes`, drain timeout, and stats interval. Capture can inherit a libpcap buffer size via `io.input.capture.scapy_bufsize` for legacy config compatibility ([config.json.md](../config.json.md), [service.go](./service.go), [capture.go](./capture.go)).
 - **Role mapping (`io.mapping.role`)** – Marks the local side as `client` or `server`, affecting how request/response directions are labeled downstream ([config.json.md](../config.json.md)).
 
+### Limitations
+This is OSS version of the software and it's intentially designed to avoid mass traffic capture.
+
 ### Running
+
 ```bash
 sudo ./stethoscope --config /path/to/config.json
 # show control plane output
@@ -43,6 +47,11 @@ nc 127.0.0.1 50005
 ```
 
 Use `sudo` or capabilities if your interface requires elevated privileges for pcap. Stats and warnings appear on stdout by default; logs can be mirrored to a file via config.
+OR as an alternative you might install package for unprivileged access to BPF:
+```bash
+# https://formulae.brew.sh/cask/wireshark-chmodbpf
+brew install --cask wireshark-chmodbpf
+```
 
 ### PCAP decoding
 

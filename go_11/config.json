@@ -47,10 +47,10 @@
 		"_linktype": "ethernet | raw (utun*) | null (loopback) | linux_sll",
   		"linktype": "ethernet",
 		"_buffer_bytes": 1048576,
-                "_c2s_buffer_bytes": 4194304,
-                "_s2c_buffer_bytes": 4194304,
-                "c2s_buffer_bytes": 2097152,
-                "s2c_buffer_bytes": 2097152
+                "c2s_buffer_bytes": 4194304,
+                "s2c_buffer_bytes": 4194304,
+                "_c2s_buffer_bytes": 2097152,
+                "_s2c_buffer_bytes": 2097152
     	    }
 	}
     },
