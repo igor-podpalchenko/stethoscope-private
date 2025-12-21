@@ -287,6 +287,13 @@ type SessionState struct {
 	S2C         DirState
 	Closed      bool
 	CloseReason string
+
+	FinC2SSeen     bool
+	FinS2CSeen     bool
+	FinC2SEndSeq   *uint32
+	FinS2CEndSeq   *uint32
+	FinC2SNotified bool
+	FinS2CNotified bool
 }
 
 func NewSessionState(flow FlowKey, ts time.Time) *SessionState {

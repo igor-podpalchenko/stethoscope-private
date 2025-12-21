@@ -120,10 +120,11 @@ type ConnectorState struct {
 type SessionOutputs struct {
 	Flow FlowKey
 
-	listenerPorts *[2]int
-	listeners     map[string]*TargetWriter
-	connectors    map[string]*TargetWriter
-	connState     map[string]*ConnectorState
+	listenerPorts    *[2]int
+	listeners        map[string]*TargetWriter
+	connectors       map[string]*TargetWriter
+	connState        map[string]*ConnectorState
+	connectorCancels map[string]context.CancelFunc
 
 	servers []net.Listener
 
@@ -136,12 +137,13 @@ type SessionOutputs struct {
 func NewSessionOutputs(flow FlowKey, parent context.Context) *SessionOutputs {
 	ctx, cancel := context.WithCancel(parent)
 	return &SessionOutputs{
-		Flow:       flow,
-		listeners:  map[string]*TargetWriter{"requests": nil, "responses": nil},
-		connectors: map[string]*TargetWriter{"requests": nil, "responses": nil},
-		connState:  map[string]*ConnectorState{"requests": {}, "responses": {}},
-		ctx:        ctx,
-		cancel:     cancel,
+		Flow:             flow,
+		listeners:        map[string]*TargetWriter{"requests": nil, "responses": nil},
+		connectors:       map[string]*TargetWriter{"requests": nil, "responses": nil},
+		connState:        map[string]*ConnectorState{"requests": {}, "responses": {}},
+		connectorCancels: map[string]context.CancelFunc{"requests": nil, "responses": nil},
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 }
 
@@ -328,6 +330,57 @@ func (om *OutputManager) MapStream(direction string) string {
 	return "requests"
 }
 
+func (om *OutputManager) closeStreamOutputs(so *SessionOutputs, stream string, reason string, cause string) {
+	cancel := so.connectorCancels[stream]
+	if cancel != nil {
+		cancel()
+		so.connectorCancels[stream] = nil
+	}
+
+	so.mu.Lock()
+	lw := so.listeners[stream]
+	tw := so.connectors[stream]
+	st := so.connState[stream]
+	so.listeners[stream] = nil
+	so.connectors[stream] = nil
+	so.mu.Unlock()
+
+	wasConnected := st != nil && st.CurrentlyConnected
+
+	if lw != nil {
+		lw.Close()
+	}
+	if tw != nil {
+		tw.Close()
+	}
+	if st != nil {
+		st.CurrentlyConnected = false
+	}
+
+	if wasConnected {
+		om.router.Emit("output", "connector_disconnected", "info", map[string]any{
+			"flow":            so.Flow.ToDict(),
+			"stream":          stream,
+			"retry_every_sec": om.connRetryEvery.Seconds(),
+			"reason":          reason,
+			"cause":           cause,
+		}, true)
+	}
+}
+
+func (om *OutputManager) CloseStream(flow FlowKey, stream string, reason string, cause string) {
+	om.mu.Lock()
+	so := om.sessions[flow]
+	om.mu.Unlock()
+	if so == nil {
+		return
+	}
+	if stream != "requests" && stream != "responses" {
+		return
+	}
+	om.closeStreamOutputs(so, stream, reason, cause)
+}
+
 func (om *OutputManager) EnsureSession(flow FlowKey) *SessionOutputs {
 	om.mu.Lock()
 	so := om.sessions[flow]
@@ -356,8 +409,12 @@ func (om *OutputManager) EnsureSession(flow FlowKey) *SessionOutputs {
 
 	// Connector mode
 	if om.connectorEnabled && om.connReqPort > 0 && om.connRespPort > 0 {
-		go om.connectorLoop(so, "requests")
-		go om.connectorLoop(so, "responses")
+		ctxReq, cancelReq := context.WithCancel(so.ctx)
+		ctxResp, cancelResp := context.WithCancel(so.ctx)
+		so.connectorCancels["requests"] = cancelReq
+		so.connectorCancels["responses"] = cancelResp
+		go om.connectorLoop(ctxReq, so, "requests")
+		go om.connectorLoop(ctxResp, so, "responses")
 	}
 
 	return so
@@ -546,7 +603,7 @@ func (om *OutputManager) handleListenerConn(so *SessionOutputs, stream string, c
 	}, true)
 }
 
-func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
+func (om *OutputManager) connectorLoop(ctx context.Context, so *SessionOutputs, stream string) {
 	host := om.connHost
 	port := om.connReqPort
 	if stream == "responses" {
@@ -555,7 +612,7 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 
 	for {
 		select {
-		case <-so.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -580,7 +637,7 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 		}
 
 		dialer := net.Dialer{Timeout: om.connConnectTO}
-		conn, err := dialer.DialContext(so.ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
+		conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
 		if err != nil {
 			om.router.Emit("debug", "connector_error", "debug", map[string]any{
 				"flow":   so.Flow.ToDict(),
@@ -589,7 +646,7 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 			}, false)
 			timer := time.NewTimer(om.connRetryEvery)
 			select {
-			case <-so.ctx.Done():
+			case <-ctx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:
@@ -628,7 +685,7 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					select {
-					case <-so.ctx.Done():
+					case <-ctx.Done():
 						tw.Close()
 						goto DISCONNECT
 					default:
@@ -647,15 +704,15 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 		so.mu.Unlock()
 		tw.Close()
 
-                // Requested: CP event only if it *was* connected before.
-                if st.CurrentlyConnected {
-                        st.CurrentlyConnected = false
-                        om.router.Emit("output", "connector_disconnected", "info", map[string]any{
-                                "flow":            so.Flow.ToDict(),
-                                "stream":          stream,
-                                "retry_every_sec": om.connRetryEvery.Seconds(),
-                        }, true)
-                } else {
+		// Requested: CP event only if it *was* connected before.
+		if st.CurrentlyConnected {
+			st.CurrentlyConnected = false
+			om.router.Emit("output", "connector_disconnected", "info", map[string]any{
+				"flow":            so.Flow.ToDict(),
+				"stream":          stream,
+				"retry_every_sec": om.connRetryEvery.Seconds(),
+			}, true)
+		} else {
 			om.router.Emit("output", "connector_disconnect_suppressed", "debug", map[string]any{
 				"flow":   so.Flow.ToDict(),
 				"stream": stream,
@@ -664,7 +721,7 @@ func (om *OutputManager) connectorLoop(so *SessionOutputs, stream string) {
 
 		timer := time.NewTimer(om.connRetryEvery)
 		select {
-		case <-so.ctx.Done():
+		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:

@@ -50,7 +50,9 @@ type ForwardChunk struct {
 	Flow      FlowKey
 	TS        time.Time
 	Direction string // c2s|s2c
+	Kind      string // data|half_close
 	Data      []byte
+	Meta      map[string]any
 }
 
 func utcISO(t time.Time) string {
