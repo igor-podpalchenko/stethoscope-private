@@ -1,7 +1,12 @@
 # Stethoscope Go v11
 
 ## Purpose
-This binary is a production-ready Go implementation of the Stethoscope TCP tap. It passively captures a single TCP flow on a specified interface, reassembles both directions, and forwards application payloads to downstream consumers. It preserves the existing configuration shape (JSON-ish configs, startup buffering, control plane) while adding guardrails such as stricter config validation and explicit back-pressure accounting.
+Stethoscope is network utility (MacOS and Linux).
+It passively captures (eavesdropping) a single TCP flow on a specified interface, reassembles TCP traffic in both directions, and forwards TCP L7 payloads to downstream sockets or pcap file.
+Basic idea behind - build simple and powerful traffic analysis tool with minimal possible operating complexity, that are suitable for automated/unattended traffic inspection and protocol decoding.
+It's intended for various network protocols research/reverse engineering.
+
+Features: JSON-ish configs, startup buffering, control plane while adding guardrails such as stricter config validation and explicit back-pressure accounting.
 
 ## How it works
 1. **Config + logging setup** – The entrypoint reads a required `--config` path, optionally overriding console verbosity with `--log-level`, then initializes logging and the service instance. Signal handlers cancel the service cleanly on SIGINT/SIGTERM.【F:go_11/main.go†L12-L66】
@@ -32,9 +37,7 @@ The app accepts JSON or “json-ish” (comments and unquoted keys) configs. Key
 
 ### Running
 ```bash
-cd go_11
-go run ./... --config /path/to/config.json
+sudo ./stethoscope --config /path/to/config.json
 # or build
-go build -o stethoscope_go11 ./...
 ```
 Use `sudo` or capabilities if your interface requires elevated privileges for pcap. Stats and warnings appear on stdout by default; logs can be mirrored to a file via config.
