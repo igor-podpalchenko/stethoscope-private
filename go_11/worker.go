@@ -133,14 +133,23 @@ func (w *ReassemblyWorker) handlePacket(p PacketInfo) {
 		w.sessionClose(st, ts, "rst")
 		return
 	}
+
 	if p.Flags&0x01 != 0 {
-		w.sessionClose(st, ts, "fin")
-		return
+		finEnd := p.Seq + uint32(len(p.Payload))
+		if p.FromLocal {
+			st.FinC2SSeen = true
+			st.FinC2SEndSeq = &finEnd
+		} else {
+			st.FinS2CSeen = true
+			st.FinS2CEndSeq = &finEnd
+		}
 	}
 
-	dir := st.S2C
+	dir := &st.S2C
+	peer := &st.C2S
 	if p.FromLocal {
-		dir = st.C2S
+		dir = &st.C2S
+		peer = &st.S2C
 	}
 	dir.NotePacket(p)
 
@@ -153,7 +162,6 @@ func (w *ReassemblyWorker) handlePacket(p PacketInfo) {
 
 	// inflight estimate from peer ACK
 	if p.FromLocal {
-		peer := st.S2C
 		if p.Ack != 0 && peer.HighestSeqSent != 0 {
 			inflight := int64(peer.HighestSeqSent) - int64(p.Ack)
 			if inflight < 0 {
@@ -164,7 +172,6 @@ func (w *ReassemblyWorker) handlePacket(p PacketInfo) {
 			}
 		}
 	} else {
-		peer := st.C2S
 		if p.Ack != 0 && peer.HighestSeqSent != 0 {
 			inflight := int64(peer.HighestSeqSent) - int64(p.Ack)
 			if inflight < 0 {
@@ -196,9 +203,48 @@ func (w *ReassemblyWorker) handlePacket(p PacketInfo) {
 			if p.FromLocal {
 				direction = "c2s"
 			}
-			w.emitChunk(ForwardChunk{Flow: p.Flow, TS: ts, Direction: direction, Data: out})
+			w.emitChunk(ForwardChunk{Flow: p.Flow, TS: ts, Direction: direction, Kind: "data", Data: out})
 		}
 	}
 
+	w.maybeEmitHalfClose(st, ts)
 	w.gc(time.Now())
+}
+
+func (w *ReassemblyWorker) maybeEmitHalfClose(st *SessionState, ts time.Time) {
+	checkHalfClose := func(seen bool, notified *bool, endSeq *uint32, dir *DirState, direction string) {
+		if !seen || *notified || endSeq == nil {
+			return
+		}
+
+		nsPtr := dir.Reasm.NextSeq
+		var ns uint32
+		hasNS := false
+		if nsPtr != nil {
+			ns = *nsPtr
+			hasNS = true
+		} else if len(dir.Reasm.Segments) == 0 {
+			ns = *endSeq
+			hasNS = true
+		}
+
+		if hasNS && ns >= *endSeq {
+			*notified = true
+			w.emitChunk(ForwardChunk{
+				Flow:      st.Flow,
+				TS:        ts,
+				Direction: direction,
+				Kind:      "half_close",
+				Data:      []byte{},
+				Meta:      map[string]any{"reason": "fin"},
+			})
+		}
+	}
+
+	checkHalfClose(st.FinC2SSeen, &st.FinC2SNotified, st.FinC2SEndSeq, &st.C2S, "c2s")
+	checkHalfClose(st.FinS2CSeen, &st.FinS2CNotified, st.FinS2CEndSeq, &st.S2C, "s2c")
+
+	if st.FinC2SSeen && st.FinS2CSeen && st.FinC2SNotified && st.FinS2CNotified {
+		w.sessionClose(st, ts, "fin")
+	}
 }

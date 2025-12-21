@@ -22,6 +22,11 @@ type dropKey struct {
 	reason    string
 }
 
+type dropAggKey struct {
+	stream string
+	reason string
+}
+
 type PcapStats struct {
 	Enabled      bool
 	Format       string
@@ -88,6 +93,8 @@ type Service struct {
 	sessionChunksDrop map[int]int64
 	dropCount         map[dropKey]int64
 	dropBytes         map[dropKey]int64
+	dropCountAgg      map[dropAggKey]int64
+	dropBytesAgg      map[dropAggKey]int64
 
 	bytesForwarded  int64
 	bytesDropped    int64
@@ -254,6 +261,8 @@ func NewService(cfg Config, log *Logger) (*Service, error) {
 		sessionChunksDrop:     map[int]int64{},
 		dropCount:             map[dropKey]int64{},
 		dropBytes:             map[dropKey]int64{},
+		dropCountAgg:          map[dropAggKey]int64{},
+		dropBytesAgg:          map[dropAggKey]int64{},
 		pcap:                  pcapStats,
 		pcapSink:              pcapSink,
 		statsInterval:         statsInterval,
@@ -305,30 +314,48 @@ func (s *Service) DropDetailSnapshot(topN int) map[string]any {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
 
-	if len(s.dropCount) == 0 {
-		return map[string]any{
-			"total_drops":    map[string]any{"count": 0, "bytes": 0},
-			"drop_by_why":    map[string]any{},
-			"drop_by_stream": map[string]any{},
+	aggCount := s.dropCountAgg
+	aggBytes := s.dropBytesAgg
+
+	if len(aggCount) == 0 || len(aggBytes) == 0 {
+		if len(s.dropCount) == 0 {
+			return map[string]any{
+				"total_drops":    map[string]any{"count": 0, "bytes": 0},
+				"drop_by_why":    map[string]any{},
+				"drop_by_stream": map[string]any{},
+			}
 		}
+		tempCount := map[dropAggKey]int64{}
+		tempBytes := map[dropAggKey]int64{}
+		for k, cnt := range s.dropCount {
+			aggKey := dropAggKey{stream: k.stream, reason: k.reason}
+			tempCount[aggKey] += cnt
+			tempBytes[aggKey] += s.dropBytes[k]
+		}
+		aggCount = tempCount
+		aggBytes = tempBytes
 	}
 
-	byReasonCnt := map[string]int64{}
-	byReasonBytes := map[string]int64{}
-	byStreamCnt := map[string]int64{}
-	byStreamBytes := map[string]int64{}
-	var totalCnt int64
-	var totalBytes int64
+	totalCnt := s.chunksDropped
+	totalBytes := s.bytesDropped
 
-	for k, cnt := range s.dropCount {
-		b := s.dropBytes[k]
-		totalCnt += cnt
-		totalBytes += b
+	byStream := map[string]map[string]int64{}
+	byReason := map[string]map[string]int64{}
 
-		byReasonCnt[k.reason] += cnt
-		byReasonBytes[k.reason] += b
-		byStreamCnt[k.stream] += cnt
-		byStreamBytes[k.stream] += b
+	for k, cnt := range aggCount {
+		b := aggBytes[k]
+
+		if _, ok := byStream[k.stream]; !ok {
+			byStream[k.stream] = map[string]int64{"count": 0, "bytes": 0}
+		}
+		byStream[k.stream]["count"] += cnt
+		byStream[k.stream]["bytes"] += b
+
+		if _, ok := byReason[k.reason]; !ok {
+			byReason[k.reason] = map[string]int64{"count": 0, "bytes": 0}
+		}
+		byReason[k.reason]["count"] += cnt
+		byReason[k.reason]["bytes"] += b
 	}
 
 	type reasonKV struct {
@@ -336,52 +363,45 @@ func (s *Service) DropDetailSnapshot(topN int) map[string]any {
 		bytes int64
 	}
 
-	reasons := make([]reasonKV, 0, len(byReasonBytes))
-	for r, b := range byReasonBytes {
-		reasons = append(reasons, reasonKV{key: r, bytes: b})
+	reasons := make([]reasonKV, 0, len(byReason))
+	for r, v := range byReason {
+		reasons = append(reasons, reasonKV{key: r, bytes: v["bytes"]})
 	}
 	sort.Slice(reasons, func(i, j int) bool { return reasons[i].bytes > reasons[j].bytes })
 
+	items := reasons
+	otherItems := []reasonKV{}
 	if topN > 0 && len(reasons) > topN {
-		keep := reasons[:topN]
-		rest := reasons[topN:]
+		items = reasons[:topN]
+		otherItems = reasons[topN:]
+	}
+
+	if len(otherItems) > 0 {
 		var otherBytes int64
 		var otherCnt int64
-		for _, r := range rest {
-			otherBytes += r.bytes
-			otherCnt += byReasonCnt[r.key]
+		for _, r := range otherItems {
+			otherBytes += byReason[r.key]["bytes"]
+			otherCnt += byReason[r.key]["count"]
 		}
-		reasons = keep
 		if otherBytes > 0 || otherCnt > 0 {
-			byReasonBytes["__other__"] = otherBytes
-			byReasonCnt["__other__"] = otherCnt
-			reasons = append(reasons, reasonKV{key: "__other__", bytes: otherBytes})
+			byReason["__other__"] = map[string]int64{"count": otherCnt, "bytes": otherBytes}
+			items = append(items, reasonKV{key: "__other__", bytes: otherBytes})
 		}
 	}
 
 	dropByWhy := map[string]any{}
-	for _, r := range reasons {
+	for _, r := range items {
 		dropByWhy[r.key] = map[string]any{
-			"count": byReasonCnt[r.key],
-			"bytes": byReasonBytes[r.key],
+			"count": byReason[r.key]["count"],
+			"bytes": byReason[r.key]["bytes"],
 		}
 	}
 
-	type streamKV struct {
-		key   string
-		bytes int64
-	}
-	streams := make([]streamKV, 0, len(byStreamBytes))
-	for sName, b := range byStreamBytes {
-		streams = append(streams, streamKV{key: sName, bytes: b})
-	}
-	sort.Slice(streams, func(i, j int) bool { return streams[i].bytes > streams[j].bytes })
-
 	dropByStream := map[string]any{}
-	for _, sInfo := range streams {
-		dropByStream[sInfo.key] = map[string]any{
-			"count": byStreamCnt[sInfo.key],
-			"bytes": byStreamBytes[sInfo.key],
+	for sName, v := range byStream {
+		dropByStream[sName] = map[string]any{
+			"count": v["count"],
+			"bytes": v["bytes"],
 		}
 	}
 
@@ -554,6 +574,73 @@ func (s *Service) flushStartupBuffersOnClose(flow FlowKey, reason string) {
 	}
 }
 
+func (s *Service) flushStartupBufferOnHalfClose(flow FlowKey, direction string, reason string) {
+	if s.startupBufferBytes <= 0 {
+		return
+	}
+	sid := flow.SessionID()
+	_ = reason
+
+	s.startupMu.Lock()
+	sb, ok := s.startupBuffers[sid]
+	if !ok {
+		s.startupMu.Unlock()
+		return
+	}
+
+	q := sb.buf[direction]
+	if len(q) == 0 {
+		sb.active[direction] = false
+		s.startupMu.Unlock()
+		return
+	}
+	s.startupMu.Unlock()
+
+	closeGraceMS := ClampInt(GetPath(s.cfg, "runtime.close_grace_ms", 100), 100, 0, 10_000)
+	if closeGraceMS > 0 {
+		time.Sleep(time.Duration(closeGraceMS) * time.Millisecond)
+	}
+
+	lingerSec := ToFloat64(GetPath(s.cfg, "runtime.close_linger_sec", 2.0), 2.0)
+	if lingerSec < 0 {
+		lingerSec = 0
+	}
+	deadline := time.Now().Add(time.Duration(lingerSec * float64(time.Second)))
+	for !s.outputs.HasActiveTargets(flow, direction) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	s.startupMu.Lock()
+	sb2, ok := s.startupBuffers[sid]
+	if !ok {
+		s.startupMu.Unlock()
+		return
+	}
+	s.startupMu.Unlock()
+
+	if s.outputs.HasActiveTargets(flow, direction) {
+		s.flushStartupBuffer(flow, direction, sb2)
+	}
+
+	s.startupMu.Lock()
+	leftover := sb2.buf[direction]
+	sb2.buf[direction] = nil
+	sb2.bytes[direction] = 0
+	sb2.active[direction] = false
+	s.startupMu.Unlock()
+
+	if len(leftover) > 0 {
+		droppedBytes := 0
+		for _, data := range leftover {
+			droppedBytes += len(data)
+		}
+		if droppedBytes > 0 {
+			stream := s.outputs.MapStream(direction)
+			s.accountLocalDrop(sid, stream, droppedBytes, "startup_buffer_discard_on_half_close", len(leftover))
+		}
+	}
+}
+
 func (s *Service) accountForwardResult(sid int, stream string, sent int, dropped int, reason string) {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
@@ -573,6 +660,9 @@ func (s *Service) accountForwardResult(sid int, stream string, sent int, dropped
 		k := dropKey{sessionID: sid, stream: stream, reason: reason}
 		s.dropCount[k] += 1
 		s.dropBytes[k] += int64(dropped)
+		aggKey := dropAggKey{stream: stream, reason: reason}
+		s.dropCountAgg[aggKey] += 1
+		s.dropBytesAgg[aggKey] += int64(dropped)
 	}
 }
 
@@ -592,10 +682,14 @@ func (s *Service) accountLocalDrop(sid int, stream string, dropped int, reason s
 		s.sessionChunksDrop[sid] += int64(chunks)
 		k := dropKey{sessionID: sid, stream: stream, reason: reason}
 		s.dropCount[k] += int64(chunks)
+		aggKey := dropAggKey{stream: stream, reason: reason}
+		s.dropCountAgg[aggKey] += int64(chunks)
 	}
 
 	k := dropKey{sessionID: sid, stream: stream, reason: reason}
 	s.dropBytes[k] += int64(dropped)
+	aggKey := dropAggKey{stream: stream, reason: reason}
+	s.dropBytesAgg[aggKey] += int64(dropped)
 }
 
 func (s *Service) GetSession(sessionID int) map[string]any {
@@ -848,24 +942,48 @@ func (s *Service) consumeForward() {
 		case <-s.ctx.Done():
 			return
 		case ch := <-s.forwardQ:
+			kind := ch.Kind
+			if kind == "" {
+				kind = "data"
+			}
+			direction := strings.ToLower(ch.Direction)
 			sid := ch.Flow.SessionID()
-			stream := s.outputs.MapStream(ch.Direction)
+			stream := s.outputs.MapStream(direction)
 
 			// Kick outputs as early as possible to avoid startup_buffer_full during connect bursts.
 			s.outputs.EnsureSession(ch.Flow)
 
+			if kind == "half_close" {
+				reason := "fin"
+				if ch.Meta != nil {
+					if r, ok := ch.Meta["reason"]; ok {
+						reason = fmt.Sprintf("%v", r)
+					}
+				}
+
+				s.flushStartupBufferOnHalfClose(ch.Flow, direction, reason)
+				s.outputs.CloseStream(ch.Flow, stream, reason, "input_half_close")
+				s.router.Emit("session", "tcp_half_close", "info", map[string]any{
+					"flow":      ch.Flow.ToDict(),
+					"direction": direction,
+					"stream":    stream,
+					"reason":    reason,
+				}, true)
+				continue
+			}
+
 			if s.startupBufferBytes > 0 {
 				sb := s.ensureStartupBufferState(sid)
 				s.startupMu.Lock()
-				active := sb.active[ch.Direction]
+				active := sb.active[direction]
 				s.startupMu.Unlock()
 
 				if active {
-					if s.outputs.HasActiveTargets(ch.Flow, ch.Direction) {
-						s.flushStartupBuffer(ch.Flow, ch.Direction, sb)
+					if s.outputs.HasActiveTargets(ch.Flow, direction) {
+						s.flushStartupBuffer(ch.Flow, direction, sb)
 					} else {
 						s.startupMu.Lock()
-						remaining := sb.limit[ch.Direction] - sb.bytes[ch.Direction]
+						remaining := sb.limit[direction] - sb.bytes[direction]
 						s.startupMu.Unlock()
 						if remaining <= 0 {
 							s.accountLocalDrop(sid, stream, len(ch.Data), "startup_buffer_full", 1)
@@ -874,13 +992,13 @@ func (s *Service) consumeForward() {
 
 						if len(ch.Data) <= remaining {
 							s.startupMu.Lock()
-							sb.buf[ch.Direction] = append(sb.buf[ch.Direction], ch.Data)
-							sb.bytes[ch.Direction] += len(ch.Data)
+							sb.buf[direction] = append(sb.buf[direction], ch.Data)
+							sb.bytes[direction] += len(ch.Data)
 							s.startupMu.Unlock()
 						} else {
 							s.startupMu.Lock()
-							sb.buf[ch.Direction] = append(sb.buf[ch.Direction], ch.Data[:remaining])
-							sb.bytes[ch.Direction] += remaining
+							sb.buf[direction] = append(sb.buf[direction], ch.Data[:remaining])
+							sb.bytes[direction] += remaining
 							s.startupMu.Unlock()
 							s.accountLocalDrop(sid, stream, len(ch.Data)-remaining, "startup_buffer_full", 1)
 						}
