@@ -51,16 +51,16 @@ type PcapSink struct {
 }
 
 const (
-// maxSnapLen defines the capture snap length we write into pcap/pcapng
-// headers. Zui/Zeek enforce that packet capture lengths do not exceed
-// the snaplen recorded in the file, so we cap both the writer headers
-// and the per-packet CaptureLength at this value to keep files
-// readable by stricter consumers.
-//
-// Keep this aligned with the Python implementation (stethoscope_pcap_v13.py),
-// which defaults to scapy's DEFAULT_SNAPLEN (currently 262_144) and is known
-// to be accepted by Zui.
-maxSnapLen = 262144
+	// maxSnapLen defines the capture snap length we write into pcap/pcapng
+	// headers. Zui/Zeek enforce that packet capture lengths do not exceed
+	// the snaplen recorded in the file, so we cap both the writer headers
+	// and the per-packet CaptureLength at this value to keep files
+	// readable by stricter consumers.
+	//
+	// Keep this aligned with the Python implementation (stethoscope_pcap_v13.py),
+	// which defaults to scapy's DEFAULT_SNAPLEN (currently 262_144) and is known
+	// to be accepted by Zui.
+	maxSnapLen = 262144
 )
 
 func NewPcapSink(enabled bool, dir, format string, perSession bool, queueSize int, log *Logger) *PcapSink {
@@ -160,7 +160,7 @@ func (p *PcapSink) openWriter(flow FlowKey, lt layers.LinkType, ci gopacket.Capt
 
 	var w pcapWriter
 	if p.stats.Format == "pcapng" {
-		ng, err := pcapgo.NewNgWriterInterface(f, pcapgo.NgInterface{SnapLength: maxSnapLen, LinkType: lt})
+		ng, err := pcapgo.NewNgWriterInterface(f, pcapgo.NgInterface{SnapLength: maxSnapLen, LinkType: lt}, pcapgo.NgWriterOptions{})
 		if err != nil {
 			f.Close()
 			return nil, err
