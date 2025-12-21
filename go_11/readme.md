@@ -66,3 +66,28 @@ Display HTTP requests URL's
 tshark -r tcpdumps/your.pcapng -Y "http.request" -T fields   -e tcp.stream -e http.host -e http.request.uri 
 ```
 
+MSS / Window Scale / SACK negotiation per connection (the SYN is where the truth lives)
+```bash
+tshark -r tcpdumps/your.pcapng -Y "tcp.flags.syn==1" \
+   -T fields -E header=y -E separator=$'\t' \
+   -e frame.time -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport \
+   -e tcp.options.mss_val -e tcp.options.wscale.shift -e tcp.options.sack_perm
+```
+
+HTTP stats (general)
+```bash
+tshark -r tcpdumps/your.pcapng -q -z http,stat
+```
+
+HTTP request <-> response stream
+```bash
+# Table text format
+python3 print_pcap_http_stream.py tcpdumps/your.pcapng --text
+
+# JSON format (jq it)
+python3 print_pcap_http_stream.py tcpdumps/your.pcapng --pretty
+
+# Extract single file from HTTP stream, XXX is value printed by print_pcap_http_stream.py - rs.frame
+./extract_file_from_pcap.sh --in tcpdumps/your.pcapng  --out b.png  --frame XXX
+```
+
