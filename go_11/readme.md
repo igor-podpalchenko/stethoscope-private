@@ -1,4 +1,4 @@
-# Stethoscope Go v11
+# Stethoscope
 
 ## Purpose
 Stethoscope is network utility (MacOS and Linux).
@@ -38,6 +38,31 @@ The app accepts JSON or “json-ish” (comments and unquoted keys) configs. Key
 ### Running
 ```bash
 sudo ./stethoscope --config /path/to/config.json
-# or build
+# show control plane output
+nc 127.0.0.1 50005
 ```
+
 Use `sudo` or capabilities if your interface requires elevated privileges for pcap. Stats and warnings appear on stdout by default; logs can be mirrored to a file via config.
+
+### PCAP decoding
+
+Display info about pcap file content
+```bash
+capinfos tcpdumps/your.pcapng
+```
+
+Extract body as files
+```bash
+tshark -r tcpdumps/your.pcapng \
+  -o tcp.desegment_tcp_streams:TRUE \
+  -o http.desegment_body:TRUE \
+  -o http.dechunk_body:TRUE \
+  -o http.decompress_body:TRUE \
+  --export-objects http,out_http
+```
+
+Display HTTP requests URL's
+```bash
+tshark -r tcpdumps/your.pcapng -Y "http.request" -T fields   -e tcp.stream -e http.host -e http.request.uri 
+```
+
