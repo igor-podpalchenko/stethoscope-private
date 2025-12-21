@@ -162,3 +162,9 @@ For PCAP remove idle_close_sec functionality. I want full sessions with SYN for 
 return aggregated stats counters (as it was before), add per session stats (bytes, drops, chunks).
 Both aggregated stats counters (by timer) and per session stats (bytes, drops, chunks) should be implemented.
 
+if we detect tcp session linked to connector is closed, we close the output.connector and emit output.connector_disconnected.
+	•	Half-close is real: TCP is full-duplex, so one side can send FIN and still receive data from the other side.
+	•	Example: client finishes uploading a request → sends FIN; server can still send the response back.
+
+If input TCP session linked to connector is closed (i.e. network error or timeout) - we should also handle this case.
+

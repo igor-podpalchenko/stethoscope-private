@@ -39,7 +39,7 @@
       		"bpf-filter": "tcp and ((src host {local_ip} and dst host {remote_ip} and dst port {remote_port}) or (src host {remote_ip} and src port {remote_port} and dst host {local_ip}))",
 		"iface": "en0",
       		"_iface": "utun7",
-		"local_ip": "192.168.5.38",
+		"local_ip": "192.168.5.48",
 		"_local_ip": "100.79.85.9",
 		"remote_ip": "192.168.5.110",
 		"remote_port": 5000,
